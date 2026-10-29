@@ -284,6 +284,12 @@ async fn definitions_returns_42_rows_with_digests() {
 /// NOTE(导航字段)：键集合比 `r1.json` 多 `category` / `category_basis` 两个**投影期
 /// 计算**的导航字段（见 `catalog_category.rs`）。它们不是定义字段，因此只出现在
 /// 键集合与下方"逐字一致"循环之外——后者仍然逐条比对 13 个 `r1.json` 字段。
+///
+/// NOTE(元数据块)：键集合另多 `unit` / `manual_location` / `index_rule` /
+/// `availability` 四个**sidecar**（`r1.meta.json`）块。它们同样不是 `r1.json`
+/// 的字段（定义侧 `unit` 实测 0 条，且 sidecar 的 `unit` 是
+/// `{value, source_ref, status}` 对象，形状不同），因此也只在键集合里出现，
+/// 不参与逐字比对。详见 `definition_meta.rs` 的专门验收。
 #[tokio::test]
 async fn definitions_payload_is_verbatim_projection() {
     let whitelist: BTreeSet<&str> = [
@@ -303,6 +309,10 @@ async fn definitions_payload_is_verbatim_projection() {
         "digest",
         "category",
         "category_basis",
+        "unit",
+        "manual_location",
+        "index_rule",
+        "availability",
     ]
     .into_iter()
     .collect();

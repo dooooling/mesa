@@ -15,6 +15,7 @@ import {
   type AcquisitionFixture238,
 } from "../test/acquisitionFixture238";
 import { selectVariableViaTreeWith } from "../test/catalogTreePick";
+import { pickObject, probeResponse } from "../test/objectCascadePick";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-238";
@@ -94,6 +95,15 @@ function installFetch(state: MockState) {
       state.lastPut = body.tasks;
       return ok({ ok: true });
     }
+    if (method === "POST" && url === `/api/v1/endpoints/${EP}/browse`) {
+      // 联动选择的按需探测：逐级候选来自驱动契约夹具（夹具只导出首页，后续页为空）。
+      const browseBody = JSON.parse(String(init?.body ?? "{}")) as {
+        parent?: string;
+        cursor?: string;
+      };
+      if ((browseBody.cursor ?? "") !== "") return ok({ nodes: [], next_cursor: null });
+      return probeResponse(browseBody.parent ?? "");
+    }
     return { ok: false, status: 404, json: async () => ({}) };
   });
 }
@@ -170,7 +180,7 @@ describe("验收 6/8：变更摘要措辞与「抵消 / 恢复原值」", () => 
     // 新增一个语义点位 → 计数「新增 1」，新行标记「新增」。
     await user.click(screen.getByTestId("add-point-entry"));
     await selectVariableViaTreeWith(user, "channel.feed.actual");
-    await user.type(screen.getByLabelText("target-channel"), "4");
+    await pickObject("channel", "通道2");
     await screen.findByTestId("nck-point-key");
     await user.click(screen.getByTestId("nck-add-point"));
     // 新行落在最后一页：直接看摘要即可（不依赖页码）。
@@ -179,8 +189,8 @@ describe("验收 6/8：变更摘要措辞与「抵消 / 恢复原值」", () => 
     );
 
     // 新增后移除 ⇒ 抵消：摘要与保存区一起消失，也不产生「移除 1」。
-    // 用新行自己的摘要（通道 4）定位，避免与夹具里既有的同变量点位混淆。
-    fireEvent.change(screen.getByTestId("point-search"), { target: { value: "通道 4" } });
+    // 用新行自己的摘要（通道 2）定位，避免与夹具里既有的同变量点位（通道 1）混淆。
+    fireEvent.change(screen.getByTestId("point-search"), { target: { value: "通道 2" } });
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1));
     await user.click(screen.getByTestId("point-row-more"));
     await user.click(await screen.findByTestId("point-row-remove"));
@@ -198,12 +208,13 @@ describe("验收 10：未实现入口不出现（声明了 import 也不渲染�
     renderPane();
     await waitAllVerified(state.fixture.points.length);
     await user.click(screen.getByTestId("add-point-entry"));
-    // 变量选择入口（语义点位）在抽屉里：唯一入口是搜索框 + 分类树。
+    // 变量选择入口（语义点位）在抽屉里：唯一入口是默认收起的树形下拉。
     await screen.findByTestId("catalog-tree");
+    expect(screen.getByTestId("nck-variable-picker-trigger")).toBeTruthy();
     expect(screen.queryByText("导入")).toBeNull();
     expect(screen.queryByRole("tab", { name: "导入" })).toBeNull();
-    // 浏览入口只由「驱动声明」+「产品实现」共同决定（NCK 已实现 browse）。
-    expect(screen.getByTestId("nck-browse-toggle")).toBeTruthy();
+    // 添加抽屉不再有独立的浏览操作入口（底层 Browse 仍供联动探测使用）。
+    expect(screen.queryByTestId("nck-browse-toggle")).toBeNull();
   });
 });
 
@@ -232,7 +243,7 @@ describe("抽屉：未确认修改关闭时提醒一次（草稿生命周期）"
 
     await user.click(screen.getByTestId("add-point-entry"));
     await selectVariableViaTreeWith(user, "channel.feed.actual");
-    await user.type(screen.getByLabelText("target-channel"), "7");
+    await pickObject("channel", "通道2");
     await screen.findByTestId("nck-point-key");
 
     // 关闭抽屉：先提醒一次（不静默丢弃）。

@@ -23,6 +23,7 @@ mod definition;
 mod definition_api;
 mod fixture;
 mod identity;
+mod identity_instances;
 mod identity_spec;
 mod native;
 mod presets;
@@ -45,9 +46,13 @@ pub use compiler::{
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use definition::{
     AddressingRule, ArgType, ArgumentSpec, CatalogError, DEFINITION_FORMAT_VERSION,
-    DefinitionCatalog, DefinitionScope, DefinitionSource, DigestError, GoldenRef, IdentityKeySpec,
+    DefinitionCatalog, DefinitionScope, DefinitionSource, DigestError,
+    EMBEDDED_DEFINITIONS_828D_R1, EMBEDDED_DEFINITIONS_828D_R1_META, GoldenRef, IdentityKeySpec,
     InvalidRuleSpec, LockEntry, MIN_DEFINITION_REVISION, NativeFieldSource, SemanticsStatus,
-    SourceKind, VariableDefinition,
+    SourceKind, VariableDefinition, git_blob_sha1,
+};
+pub use definition_api::{
+    AVAILABILITY_STATES, DefinitionMeta, META_BLOCK_KEYS, META_DEFINITION_FILE, META_FORMAT_VERSION,
 };
 pub use fixture::{NckFixture, NckFixtureState};
 pub use identity_spec::{
@@ -999,7 +1004,13 @@ impl DriverConnection for NckConnection {
     /// 浏览：只有两类入口——**可选模板预填**与**只读身份核对**。
     ///
     /// 不再有 Catalog 虚拟树：模板缺失/非法只让模板入口显示诊断，
-    /// 手动原生地址与身份核对都不依赖它。未知 parent → 空页。
+    /// 手动原生地址与身份核对都不依赖它。
+    ///
+    /// **未知 parent 是错误，不是空页**（本轮纠正）：`parent` 为空才代表根；
+    /// 除此之外只有本驱动真实给出的节点 id 合法。旧行为对未知 id 静默返回空页，
+    /// 于是"字段名写错（例如把 `parent` 写成 `parent_node_id`）→ 请求里 parent 为空
+    /// → 静默返回根节点"这条链路完全不可见，用户看到的是"根目录又出现了"或
+    /// "这里没有对象"，与设备事实无法区分。现在改为 `UNKNOWN_PARENT` 稳定码。
     async fn browse(
         &self,
         parent: &str,
@@ -1059,7 +1070,11 @@ impl DriverConnection for NckConnection {
             }
             return Ok(paginate(nodes, filter, cursor, limit));
         }
-        Ok((Vec::new(), None))
+        // 未知父节点：明确报错（稳定码），绝不回落到空页或根节点伪装成功。
+        Err(SdkDriverError::configuration(
+            browse_selection::CODE_UNKNOWN_PARENT,
+            format!("未知的浏览父节点 `{parent}`：只接受根（空 parent）或驱动列出的节点 id"),
+        ))
     }
 }
 

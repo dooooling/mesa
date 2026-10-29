@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { invokeDisabledButton } from "../test/bypassDisabled";
 import { renderAddDeviceFlow as renderFlow } from "../test/addDeviceFlowHarness";
 import { selectVariableViaTreeWith } from "../test/catalogTreePick";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 beforeEach(() => {
   vi.useRealTimers();
@@ -88,6 +89,7 @@ function nckDefinition(variableId: string, overrides: Record<string, unknown> = 
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: `${variableId}@channel={channel}`,
     identity_keys: [{ path: "channel", required: true }],
     golden_ref: [],
@@ -240,20 +242,45 @@ async function walkNckToDataStep(
   return { calls, user, container };
 }
 
-/** 在语义页加入一个点位（只填 Target，不填任何原生字段）。 */
-async function addSemanticPoint(
+/**
+ * 在向导的语义页选中变量后，**语义点位无法配置**（Endpoint 尚未创建 ⇒ 无法探测实际
+ * 对象 ⇒ 缺参数且无法从设备探测获得）。这里断言的是"明确阻断 + 两条出路"，
+ * 而不是"再给一套手填参数表单"。
+ */
+async function expectSemanticAddBlocked(
   user: ReturnType<typeof userEvent.setup>,
-  channel = "1",
   variableId = "syn.collect.a",
 ) {
   await waitFor(() => expect(screen.getByTestId("catalog-tree")).toBeTruthy());
   await selectVariableViaTreeWith(user, variableId);
-  const input = screen.getByLabelText("target-channel");
-  await user.clear(input);
-  await user.type(input, channel);
-  await screen.findByTestId("nck-point-key");
-  const key = screen.getByTestId("nck-point-key").textContent ?? "";
-  await user.click(screen.getByTestId("nck-add-point"));
+  const select = screen.getByTestId("nck-object-select-channel") as HTMLSelectElement;
+  expect(select.disabled).toBe(true);
+  expect(screen.getByTestId("nck-cascade-gate").textContent).toContain("需先创建并连接端点");
+  // 没有手填参数表单（回退即违规）。
+  expect(screen.queryByTestId(/^nck-target-/)).toBeNull();
+  expect(screen.queryByTestId(/^nck-argument-/)).toBeNull();
+  const missing = screen.getByTestId("nck-cascade-missing");
+  expect(missing.textContent).toContain("缺少参数 channel");
+  expect(missing.textContent).toContain("无法从设备探测获得");
+  // 阻断文案必须给出**下一步**：先建端点→采集页配置；或切高级原生配置。
+  const guidance = screen.getByTestId("nck-cascade-guidance").textContent ?? "";
+  expect(guidance).toContain("先完成设备创建与连接");
+  expect(guidance).toContain("「采集」页配置点位");
+  expect(guidance).toContain("「高级原生配置」");
+  // 不可加入（按钮禁用；程序化点击也不产生草稿点位）。
+  const add = screen.getByTestId("nck-add-point") as HTMLButtonElement;
+  expect(add.disabled).toBe(true);
+  fireEvent.click(add);
+  expect(screen.queryByTestId("nck-draft-point-row")).toBeNull();
+  expect(screen.queryByTestId("nck-point-key")).toBeNull();
+}
+
+/** 在向导里通过「高级原生配置」加入一个 derived 原生点位（向导内唯一可用的配置入口）。 */
+async function addNativePoint(user: ReturnType<typeof userEvent.setup>) {
+  fireEvent.click(screen.getByRole("button", { name: /高级原生配置/ }));
+  await screen.findByTestId("nck-native-fields");
+  const key = screen.getByTestId("nck-native-key").textContent ?? "";
+  await user.click(screen.getByTestId("nck-native-add-point"));
   await screen.findByTestId("nck-draft-point-row");
   return key;
 }
@@ -278,19 +305,18 @@ type BootstrapBody = {
 
 describe("PR-D D1–D3：NCK 数据步只提供语义入口", () => {
   it("nck_semantic_mode_does_not_require_native_fields (A8)", async () => {
-    await walkNckToDataStep();
+    const { user } = await walkNckToDataStep();
     await screen.findByTestId("nck-catalog-meta");
 
-    // 只填 Target 即可加入：不得出现「缺少必填参数：area/area_no/...」。
+    // 语义模式不要求原生字段：没有「缺少必填参数：area/area_no/...」这类提示。
     expect(screen.queryByText(/缺少必填参数/)).toBeNull();
     expect(screen.queryByTestId("missing-required")).toBeNull();
-    // §4.1-4：未选择变量时只保留一个选择入口（没有提交按钮，也就没有可提交路径）。
-    expect(screen.queryByTestId("nck-add-point")).toBeNull();
+    // §4.1-4：未选择变量时只保留一个选择入口；添加按钮在场但禁用（无可提交路径）。
+    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
 
-    await addSemanticPoint(userEvent.setup(), "1");
-    expect(screen.getByTestId("nck-draft-point-row").textContent).toContain(
-      "syn.collect.a@channel=1",
-    );
+    // 选中变量后：语义点位需要探测实际对象，而向导内 Endpoint 尚未创建 ⇒
+    // 明确阻断并给出下一步（不要求填原生字段，也不回退手填参数）。
+    await expectSemanticAddBlocked(user);
   }, 30_000);
 
   it("nck_semantic_picker_is_default_entry_in_wizard (A21)", async () => {
@@ -298,9 +324,12 @@ describe("PR-D D1–D3：NCK 数据步只提供语义入口", () => {
     await screen.findByTestId("nck-catalog-meta");
 
     expect(screen.getByTestId("nck-semantic-picker")).toBeTruthy();
-    // 变量选择入口 = 搜索框 + 分类树（平铺下拉框已按评审要求移除）。
-    expect(screen.getByTestId("nck-variable-search")).toBeTruthy();
+    // 变量选择入口 = 默认收起的树形下拉；展开后才出现搜索框与分组。
     expect(screen.getByTestId("catalog-tree")).toBeTruthy();
+    expect(screen.queryByTestId("nck-variable-search")).toBeNull();
+    fireEvent.click(screen.getByTestId("nck-variable-picker-trigger"));
+    expect(screen.getByTestId("nck-variable-search")).toBeTruthy();
+    expect(screen.getByTestId("catalog-tree-panel")).toBeTruthy();
     // 旧通用 Picker 的手动页整体不渲染：无「手动」Tab、无 output 复选框、无「无可用资源」。
     expect(screen.queryByRole("tab", { name: "手动" })).toBeNull();
     expect(screen.queryByRole("checkbox", { name: "output-value" })).toBeNull();
@@ -365,7 +394,6 @@ describe("PR-D D4–D5：目录先于 Endpoint、family 取自连接草稿", () 
     });
     await screen.findByTestId("nck-catalog-meta");
     await selectVariableViaTreeWith(user, "syn.collect.a");
-    await user.type(screen.getByLabelText("target-channel"), "1");
     await screen.findByTestId("nck-family-reject");
     expect(screen.getByTestId("nck-family-reject").textContent).toContain("FAMILY_MISMATCH");
     expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
@@ -373,13 +401,14 @@ describe("PR-D D4–D5：目录先于 Endpoint、family 取自连接草稿", () 
     expect(calls.some((c) => c.url.endsWith("/identity-preview"))).toBe(false);
   }, 30_000);
 
-  it("preview_request_family_equals_connection_draft", async () => {
+  it("wizard_sends_no_preview_because_there_is_no_endpoint_to_probe", async () => {
+    // 联动选择必须先探测实际对象；向导里没有 Endpoint ⇒ 不发探测、不发预览，
+    // 语义点位保持不可配置（family 权威性由端点采集页用例覆盖）。
     const { calls, user } = await walkNckToDataStep({ family: "828d" });
     await screen.findByTestId("nck-catalog-meta");
-    await addSemanticPoint(user, "7");
-    const preview = calls.find((c) => c.url.endsWith("/identity-preview"));
-    expect(preview).toBeTruthy();
-    expect((preview!.body as { family: string }).family).toBe("828d");
+    await expectSemanticAddBlocked(user);
+    expect(calls.some((c) => c.url.endsWith("/identity-preview"))).toBe(false);
+    expect(calls.some((c) => c.url.includes("/browse"))).toBe(false);
   }, 30_000);
 
   it("family_missing_blocks_add_and_submit", async () => {
@@ -389,7 +418,6 @@ describe("PR-D D4–D5：目录先于 Endpoint、family 取自连接草稿", () 
     expect(screen.getByTestId("nck-family-missing")).toBeTruthy();
 
     await selectVariableViaTreeWith(user, "syn.collect.a");
-    await user.type(screen.getByLabelText("target-channel"), "1");
     await screen.findByTestId("nck-family-reject");
     expect(screen.getByTestId("nck-family-reject").textContent).toContain(
       "FAMILY_ENDPOINT_MISSING",
@@ -408,8 +436,10 @@ describe("PR-D D6–D10：提交体、单写路径、零采集点与全链", () 
   it("nck_bootstrap_body_is_nck_points_v1", async () => {
     const { calls, user } = await walkNckToDataStep();
     await screen.findByTestId("nck-catalog-meta");
-    const key = await addSemanticPoint(user, "1");
-    expect(key).toBe("syn.collect.a@channel=1");
+    // 向导内 Endpoint 尚未创建 ⇒ 语义点位无法探测配置；初始点位改由**高级原生配置**
+    // 产生（`NckNativeFields` 原样保留）。这里验证的是提交体形状与单写路径。
+    const key = await addNativePoint(user);
+    expect(key).toBe("native.N.1.2.3.4");
     // 采集周期改 2000，证明 schedule 来自草稿。
     fireEvent.change(screen.getByText("采集周期").parentElement!.querySelector("input")!, {
       target: { value: "2000" },
@@ -430,20 +460,11 @@ describe("PR-D D6–D10：提交体、单写路径、零采集点与全链", () 
     expect(task.id).toBe("t1");
     expect(task.schedule).toEqual({ mode: "poll", interval_ms: 2000 });
     expect(task.binding.kind).toBe("nck.points.v1");
-    // 请求体**恰为** `{points}`，且 point_key 逐字等于服务端预览值。
+    // 请求体**恰为** `{points}`，且 point_key 逐字等于表单给出的身份（不自动改名）。
     expect(Object.keys(task.binding.config)).toEqual(["points"]);
-    expect(task.binding.config.points).toEqual([
-      {
-        kind: "nck_variable",
-        point_key: "syn.collect.a@channel=1",
-        parameters: {
-          variable_id: "syn.collect.a",
-          definition_revision: 1,
-          target: { channel: 1 },
-          arguments: {},
-        },
-      },
-    ]);
+    expect((task.binding.config.points as Array<{ point_key: string; kind: string }>)[0]).toEqual(
+      expect.objectContaining({ kind: "nck_native", point_key: "native.N.1.2.3.4" }),
+    );
     // 默认不启动（未勾选）。
     expect(body.start).toBe(false);
     expect(body.idempotency_key).toMatch(/^web-op-/);
@@ -617,34 +638,34 @@ describe("PR-D：Native 高级模式（向导级）", () => {
 });
 
 describe("PR-D：删除后重加与连接草稿变更", () => {
-  it("nck_remove_then_readd_requires_fresh_preview", async () => {
+  it("nck_remove_then_readd_requires_fresh_form_state", async () => {
     const { calls, user } = await walkNckToDataStep();
     await screen.findByTestId("nck-catalog-meta");
-    const firstKey = await addSemanticPoint(user, "1");
-    expect(firstKey).toBe("syn.collect.a@channel=1");
-    expect(calls.filter((c) => c.url.endsWith("/identity-preview"))).toHaveLength(1);
+    const firstKey = await addNativePoint(user);
+    expect(firstKey).toBe("native.N.1.2.3.4");
+    expect(screen.getByTestId("nck-draft-point-row").textContent).toContain("native.N.1.2.3.4");
 
     // 显式移除：只改本地草稿，不发网络写请求。
     const writesBefore = calls.filter((c) => c.method !== "GET").length;
     await user.click(screen.getByTestId("nck-remove-point"));
     expect(screen.queryByTestId("nck-draft-point-row")).toBeNull();
     expect(calls.filter((c) => c.method !== "GET").length).toBe(writesBefore);
-    // 删除后表单里没有旧 Preview 留下的 Key（未选变量时连身份行都不渲染）。
+    // 删除后表单里没有旧身份残留（未选变量时连身份行都不渲染）。
     expect(screen.queryByTestId("nck-point-key-empty")).toBeNull();
     expect(screen.queryByTestId("nck-point-key")).toBeNull();
 
-    // 重新加入必须重新选择并重新请求服务端 Preview（不复用旧状态）。
-    await addSemanticPoint(user, "1");
-    expect(calls.filter((c) => c.url.endsWith("/identity-preview"))).toHaveLength(2);
+    // 重新加入必须重新走一遍表单（不复用旧状态）：Key 由当前字段重新生成。
+    const secondKey = await addNativePoint(user);
+    expect(secondKey).toBe("native.N.1.2.3.4");
     expect(screen.getByTestId("nck-draft-point-row").textContent).toContain(
-      "syn.collect.a@channel=1",
+      "native.N.1.2.3.4",
     );
   }, 30_000);
 
   it("connection_draft_change_clears_nck_draft_and_catalog", async () => {
     const { calls, user, container } = await walkNckToDataStep();
     await screen.findByTestId("nck-catalog-meta");
-    await addSemanticPoint(user, "1");
+    await addNativePoint(user);
     expect(calls.filter((c) => c.url.startsWith("/api/v1/drivers/sinumerik-nck/definitions") && c.method === "GET")).toHaveLength(1);
 
     // 返回连接步骤，更换 family（828d → 840d-sl）。
@@ -682,6 +703,6 @@ describe("PR-D：删除后重加与连接草稿变更", () => {
     await waitFor(() => expect(bootstrapBodies(calls)).toHaveLength(1));
     const body = bootstrapBodies(calls)[0] as unknown as BootstrapBody;
     expect(body.acquisition.tasks).toEqual([]);
-    expect(JSON.stringify(body)).not.toContain("syn.collect.a@channel=1");
+    expect(JSON.stringify(body)).not.toContain("native.N.1.2.3.4");
   }, 30_000);
 });

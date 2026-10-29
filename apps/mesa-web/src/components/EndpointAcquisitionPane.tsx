@@ -33,6 +33,7 @@ import {
   collectableDefinitions,
   evaluateNckSelectionAdd,
 } from "../nckCollectability";
+import { summarizeAvailability } from "../definitionMeta";
 import { nckPointsOf, parseTaskBinding, selectEditableTask } from "../nckTaskBinding";
 import {
   endpointSaveChangeState,
@@ -87,7 +88,6 @@ import {
   evaluateNckPointIdentity,
   type NckDefinitionLike,
 } from "../nckPointModel";
-import { createNckSemanticHandler } from "../nckBrowseSemantic";
 import {
   nativeAddressParameters,
   validateNativeFields,
@@ -97,7 +97,6 @@ import { applySelectionAdd } from "../resourceSelectionModel";
 import { objectProbeGate } from "../objectProbe";
 import type { ApplyResult } from "./ApplyWithRestart";
 import { NckPointFields } from "./NckPointFields";
-import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
 import { ResourcePickerAntd } from "./ResourcePickerAntd";
 import {
   UNSUPPORTED_CONFIG_NOTICE,
@@ -382,12 +381,9 @@ export function EndpointAcquisitionPane({
   // `{resource_id,parameters,outputs}`），混用下标会让表单读错数据。
   const [editingSelIndex, setEditingSelIndex] = useState<number | null>(null);
   const [formVersion, setFormVersion] = useState(0);
-  // Browse → 语义表单的预填（A1/A16 的入口）。preview_point_key 不参与提交。
-  const [browseOpen, setBrowseOpen] = useState(false);
-  const [browsePreset, setBrowsePreset] = useState<NckPointSelection | null>(null);
-  // Browse 语义叶带来的 `identity.keys`（驱动在 wire 上声明"还需要哪类实例"）。
-  // 只作为「选择实际对象」的需求来源之一（与定义 targets 取并集，均为数据）。
-  const [browseIdentityKeys, setBrowseIdentityKeys] = useState<unknown>(null);
+  // 说明：添加点位抽屉里**不再有**独立的 Browse 操作入口（`ResourceBrowseAntd`）。
+  // 底层 Browse 能力仍保留：联动选择的对象探测走 `POST /endpoints/{id}/browse`
+  // （`objectCascade.scanObjectCandidates`），向导/通用资源选择仍可使用浏览组件。
 
   /**
    * 「选择实际对象」探测入口的可用性。
@@ -447,6 +443,12 @@ export function EndpointAcquisitionPane({
   const collectableDefs = useMemo(
     () => collectableDefinitions(definitionList),
     [definitionList],
+  );
+  // 统计口径：可添加 = ready + candidate；hold / reference_only / 缺失或非法
+  // 各自单列，**绝不**混进"可配置"（否则 36 条全被说成能加，点进去才被门禁拒）。
+  const availabilityStats = useMemo(
+    () => summarizeAvailability(collectableDefs),
+    [collectableDefs],
   );
   // native 12 字段 Schema 的唯一来源：Descriptor 的 variable 资源（不硬编码）。
   const nativeSchema = useMemo(() => {
@@ -750,9 +752,6 @@ export function EndpointAcquisitionPane({
     setEditingIndex(null);
     setEditingSelIndex(null);
     setFormVersion(0);
-    setBrowseOpen(false);
-    setBrowsePreset(null);
-    setBrowseIdentityKeys(null);
     // 列表/搜索/分页与抽屉：切换连接后回到第 1 页、清空搜索与筛选。
     setPage(1);
     setPageSize(25);
@@ -961,8 +960,7 @@ export function EndpointAcquisitionPane({
     setNckPoints((prev) => [...prev, point]);
     // 新行分配**新** rowId（删除过的 id 不复用）；既有行身份不变（§4.8）。
     setNckRowIds((prev) => [...prev, rowIdAllocator.current.next()]);
-    // 表单重建一次：避免上一条目的输入（含 Browse 预填）残留到下一次新增。
-    setBrowsePreset(null);
+    // 表单重建一次：避免上一条目的输入残留到下一次新增。
     setFormVersion((v) => v + 1);
     // 只更新页面草稿：不发任何写请求；抽屉关闭后回到原列表位置（§4.1-8）。
     closeDrawer();
@@ -1070,8 +1068,6 @@ export function EndpointAcquisitionPane({
     setLocatedIssue(null);
     setEditingIndex(null);
     setEditingSelIndex(null);
-    setBrowsePreset(null);
-    setBrowseIdentityKeys(null);
     setFormVersion((v) => v + 1);
     setDrawerDirty(false);
     setDrawerOpen(true);
@@ -1084,7 +1080,6 @@ export function EndpointAcquisitionPane({
     setLocatedIssue(null);
     setEditingIndex(index);
     setEditingSelIndex(null);
-    setBrowsePreset(null);
     setFormVersion((v) => v + 1);
     setDrawerDirty(false);
     setDrawerOpen(true);
@@ -1104,7 +1099,6 @@ export function EndpointAcquisitionPane({
     setLocatedIssue(null);
     setEditingIndex(null);
     setEditingSelIndex(index);
-    setBrowsePreset(null);
     setFormVersion((v) => v + 1);
     setDrawerDirty(false);
     setDrawerOpen(true);
@@ -1831,7 +1825,6 @@ export function EndpointAcquisitionPane({
       restoreScrollTop.current = listScrollRef.current?.scrollTop ?? 0;
       if (nck) setEditingIndex(index);
       else setEditingSelIndex(index);
-      setBrowsePreset(null);
       setFormVersion((v) => v + 1);
       setDrawerDirty(false);
       setDrawerOpen(true);
@@ -2541,28 +2534,7 @@ export function EndpointAcquisitionPane({
                 message="定义目录不可用：NCK 保存已禁用（fail-closed）"
                 description="没有定义目录就无法确认哪些变量可采集（scope 准入），因此保存保持禁用；在可用前不会出现“保存成功但编辑没生效”。"
               />
-            ) : (
-              <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-collectable-summary">
-                {/* 目录统计不在默认页面上：收进抽屉（搜索即列表，选中才展示定义信息）。 */}
-                <div style={{ fontSize: 13, color: "#262626" }} data-testid="nck-collectable-count">
-                  {collectableDefs.length} 个可配置变量
-                </div>
-                <details data-testid="nck-catalog-details" style={{ marginTop: 4 }}>
-                  <summary style={{ cursor: "pointer", fontSize: 11 }}>目录详情</summary>
-                  <div style={{ marginTop: 4, fontSize: 11 }} data-testid="nck-catalog-meta">
-                    共 {definitionList.length} 条定义（其余为身份探针或缺少 scope，不可采集）
-                    {" · "}目录：
-                    {catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
-                    {" · "}Endpoint family：
-                    {endpointFamilyState === "loading"
-                      ? "读取中"
-                      : endpointFamilyState === "error"
-                        ? "读取失败"
-                        : endpointFamily ?? "缺失（禁止提交）"}
-                  </div>
-                </details>
-              </div>
-            )}
+            ) : null}
 
             {definitions && endpointFamilyState === "ready" && !endpointFamily ? (
               <Alert
@@ -2573,42 +2545,13 @@ export function EndpointAcquisitionPane({
               />
             ) : null}
 
-            {/* Browse 入口：只在驱动声明了 browse 时出现（不新增特判，§4.1-2）。 */}
-            {definitions && (desc?.resource_selection_methods ?? []).includes("browse") ? (
-              <div style={{ display: "grid", gap: 8 }}>
-                <div>
-                  <Button
-                    size="small"
-                    type="link"
-                    data-testid="nck-browse-toggle"
-                    onClick={() => setBrowseOpen((v) => !v)}
-                  >
-                    {browseOpen ? "收起浏览" : "从浏览树选择语义变量"}
-                  </Button>
-                </div>
-                {browseOpen ? (
-                  <ResourceBrowseAntd
-                    endpointId={endpointId}
-                    onFill={() => message.warning("请选用语义点位（旧资源入口在 NCK 上已被禁用）")}
-                    // 语义载荷解析由 NCK 处理器注入；可选性/阻断原因由驱动给出（IPC 1.8）。
-                    semanticHandler={createNckSemanticHandler()}
-                    onSemanticSelect={(sel) => {
-                      setBrowsePreset({
-                        kind: sel.pointKind,
-                        point_key: "",
-                        parameters: sel.parameters,
-                      });
-                      // 只取 wire 的 identity.keys（"还需要哪类实例"）；preview_point_key
-                      // 仅展示，不进提交载荷。
-                      setBrowseIdentityKeys(sel.identity?.keys ?? null);
-                      setEditingIndex(null);
-                      setFormVersion((v) => v + 1);
-                      message.info("已把浏览叶带入语义表单：请等待服务端预览确认身份");
-                    }}
-                  />
-                ) : null}
-              </div>
-            ) : null}
+            {/*
+              这里**不再有**独立的「从浏览树选择」入口：它曾是一套与联动选择并列的
+              浏览操作，占掉大量首屏空间，并让同一个身份坐标存在两条产生路径。
+              底层 Browse 能力保留在 `objectCascade.scanObjectCandidates`（对象探测
+              仍走 `POST /endpoints/{id}/browse`），向导里的语义浏览仍由
+              `NckSemanticPicker` 提供。
+            */}
 
             {definitions ? (
               editingIndex !== null && nckPoints[editingIndex] ? (
@@ -2623,6 +2566,7 @@ export function EndpointAcquisitionPane({
                   nativeSchema={nativeSchema}
                   endpointId={endpointId}
                   probeGate={probeGate}
+                  variableStats={availabilityStats}
                   submitLabel="确认修改"
                   onDirtyChange={setDrawerDirty}
                   onCancel={requestCloseDrawer}
@@ -2642,17 +2586,41 @@ export function EndpointAcquisitionPane({
                   catalogFamily={catalogFamily}
                   definitions={collectableDefs}
                   takenPointKeys={takenPointKeys(null)}
-                  initialPoint={browsePreset}
+                  initialPoint={null}
                   nativeSchema={nativeSchema}
                   // 「选择实际对象」：只有已创建且连接可读的端点才允许按需探测。
                   endpointId={endpointId}
                   probeGate={probeGate}
-                  objectIdentityKeys={browsePreset ? browseIdentityKeys : null}
+                  variableStats={availabilityStats}
                   submitLabel="加入待保存列表"
                   onDirtyChange={setDrawerDirty}
                   onSubmit={addPoint}
                 />
               )
+            ) : null}
+
+            {/*
+              目录详情收在表单之后：首屏先给「模式切换 → 变量 → 对象 → 添加」，
+              统计口径的一行小字在变量选择下方，不再占据抽屉顶部。
+            */}
+            {definitions ? (
+              <div style={{ fontSize: 12, color: "#525252" }} data-testid="nck-collectable-summary">
+                <details data-testid="nck-catalog-details">
+                  <summary style={{ cursor: "pointer", fontSize: 11 }}>目录详情</summary>
+                  <div style={{ marginTop: 4, fontSize: 11 }} data-testid="nck-catalog-meta">
+                    共 {definitionList.length} 条定义（其余为身份探针或缺少 scope，不可采集）
+                    {" · "}可添加口径：ready + candidate（暂缓/仅参考不计入）
+                    {" · "}目录：
+                    {catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
+                    {" · "}Endpoint family：
+                    {endpointFamilyState === "loading"
+                      ? "读取中"
+                      : endpointFamilyState === "error"
+                        ? "读取失败"
+                        : endpointFamily ?? "缺失（禁止提交）"}
+                  </div>
+                </details>
+              </div>
             ) : null}
           </div>
         ) : (

@@ -14,6 +14,7 @@
 import { NCK_POINTS_KIND, type AcquisitionTaskShape, type NckPointSelection } from "../deviceModel";
 import type { NckDefinitionMap } from "../components/EndpointAcquisitionPane";
 import type { ResourceDescriptor } from "../types";
+import { CANDIDATE_AVAILABILITY } from "./availabilityFixture";
 
 /** 原生点位的 (area, module, 数量) 分布（逐项对齐 238 点快照中的 235 个原生点位）。 */
 export const NATIVE_DISTRIBUTION: ReadonlyArray<readonly [string, number, number]> = [
@@ -42,6 +43,7 @@ export const SEMANTIC_DEFINITIONS: NckDefinitionMap = {
     targets: ["axis", "channel"],
     target_required: ["axis", "channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: "axis.position.actual_bcs@axis=i:{axis},channel=i:{channel}",
   },
   "channel.feed.actual": {
@@ -53,6 +55,7 @@ export const SEMANTIC_DEFINITIONS: NckDefinitionMap = {
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: "channel.feed.actual@channel=i:{channel}",
   },
   "channel.program.status": {
@@ -64,6 +67,7 @@ export const SEMANTIC_DEFINITIONS: NckDefinitionMap = {
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: "channel.program.status@channel=i:{channel}",
   },
 };

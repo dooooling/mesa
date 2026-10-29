@@ -1,12 +1,13 @@
 // 目录树选变量助手（仅测试用）。
 //
 // 为什么需要它：评审要求移除与分类树重复的**平铺变量下拉框**（`nck-variable-select`），
-// 变量选择入口只剩「搜索框 + 分类树」。于是所有原本 `user.selectOptions(select, id)`
-// 的用例都必须改成「在树上点叶子」，而这件事散落在 8 个测试文件里——集中成一个助手
-// 才能保证：
+// 变量选择入口只剩「搜索框 + 分类树」。现在分类树进一步收敛为**默认收起的紧凑
+// 树形下拉**，于是所有原本 `user.selectOptions(select, id)` 的用例都必须改成
+// 「打开下拉 → 展开分组 → 点叶子」，而这件事散落在多个测试文件里——集中成一个
+// 助手才能保证：
 //   - 叶子定位口径唯一（`catalog-tree-leaf-<variableId>`，与 `CatalogCategoryTree` 的
 //     约定同源，不在测试里各写各的选择器）；
-//   - 分组折叠的兜底逻辑只写一遍（树默认全展开，但用例可以手动折叠分组）；
+//   - 打开下拉 / 展开分组的兜底逻辑只写一遍（默认收起，但用例可以手动展开/收起）；
 //   - 找不到叶子时的失败信息可读（列出当前可见叶子，便于判断是「被搜索过滤掉了」
 //     还是「分组被折叠了」）。
 //
@@ -52,12 +53,46 @@ export function selectedCatalogLeafIds(): string[] {
 }
 
 /**
+ * 打开变量下拉（若已经打开则不动）。
+ *
+ * 默认收起是产品行为：直接点叶子之前必须先展开下拉；这个助手把「打开」动作
+ * 集中在一处，避免每个用例各写一遍触发按钮的选择器。
+ */
+export function openVariablePicker(): HTMLElement {
+  if (screen.queryByTestId("catalog-tree-panel")) {
+    return screen.getByTestId("catalog-tree-panel");
+  }
+  fireEvent.click(screen.getByTestId("nck-variable-picker-trigger"));
+  return screen.getByTestId("catalog-tree-panel");
+}
+
+/** 展开某个分类分组（幂等：已展开则不再点击）。 */
+export function expandCatalogGroup(code: string): void {
+  openVariablePicker();
+  const group = screen.getByTestId(`catalog-tree-group-${code}`);
+  if (group.getAttribute("data-expanded") !== "true") {
+    fireEvent.click(screen.getByTestId(`catalog-tree-toggle-${code}`));
+  }
+}
+
+/** 展开当前所有分组（仅用于"需要看全量叶子"的计数/搜索类断言）。 */
+export function expandAllCatalogGroups(): void {
+  openVariablePicker();
+  for (const toggle of screen.queryAllByTestId(/^catalog-tree-toggle-/)) {
+    if (toggle.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(toggle);
+    }
+  }
+}
+
+/**
  * 尝试定位变量叶子：找不到就把**折叠中的**分组逐个展开再找。
  *
  * 注意：**被搜索词过滤掉的条目不会被这个兜底救回来**——过滤是产品行为，
  * 用例需要先清空搜索框（`nck-variable-search`）再选。
  */
 function tryFindLeaf(variableId: string): HTMLElement | null {
+  openVariablePicker();
   const testId = catalogLeafTestId(variableId);
   const direct = screen.queryByTestId(testId);
   if (direct) return direct;

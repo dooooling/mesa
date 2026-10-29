@@ -184,24 +184,30 @@ async fn browse_unsupported_for_s7_and_simulator() {
             .body(Body::from(r#"{"parent":"","limit":5}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // S7/test-driver 不支持 browse，应返回 503 或 400；且 body 不得是
-        // DRIVER_UNAVAILABLE（binary 缺失的假绿出口，前置 find_driver 已先拦一道）。
-        assert!(
-            resp.status() == StatusCode::SERVICE_UNAVAILABLE
-                || resp.status() == StatusCode::BAD_REQUEST,
-            "driver {driver} browse should be unsupported, got {}",
-            resp.status()
+        // S7/test-driver 不支持 browse：驱动在 IPC 上声明 `Unsupported`，
+        // REST 按**通用类别**映射为 501 NOT_IMPLEMENTED（本轮修复后的口径）。
+        //
+        // 之前这里放宽到「503 或 400」是因为 kind 在 Manager 边界被丢弃，
+        // REST 只能按码猜，于是"协议不支持"与"参数写错"不可区分。现在
+        // 类别一路到达 REST，状态码是确定的 501——因此断言收紧为精确值，
+        // 同时仍禁止 DRIVER_UNAVAILABLE 这条"binary 缺失"的假绿出口。
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "driver {driver} browse 不支持必须是 501（Unsupported 类别）"
         );
-        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
-            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let text = String::from_utf8_lossy(&body);
-            assert!(
-                !text.contains("DRIVER_UNAVAILABLE"),
-                "driver {driver} browse 503 必须是不支持语义，不得是驱动缺失：{text}"
-            );
-        }
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("DRIVER_UNAVAILABLE"),
+            "driver {driver} browse 501 必须是不支持语义，不得是驱动缺失：{text}"
+        );
+        assert!(
+            text.contains("UNSUPPORTED"),
+            "driver {driver} browse 必须透出驱动自己的稳定码：{text}"
+        );
     }
     std::fs::remove_dir_all(&root).ok();
 }
@@ -260,7 +266,12 @@ async fn browse_sinumerik_nck_catalog_tree_e2e() {
         nodes[1]["kind"], "diagnostic",
         "无探针系列必须明确提示身份浏览待验证"
     );
-    // 根目录不访问控制器；未知 parent 同样空页（不伪造内容）。
+    // 根目录不访问控制器；**未知 parent 必须是错误**（纠正后的行为）。
+    //
+    // 旧行为是"未知 parent → 空页"，于是「把请求字段写成 `parent_node_id`」这种
+    // 客户端错误在链路上完全不可见（请求里 parent 为空 → 静默返回根节点），
+    // 用户看到的是"根目录又出现了"或"这里没有对象"，与设备事实无法区分。
+    // 现在空 parent 才是根，其余未知 id 一律 `UNKNOWN_PARENT`（HTTP 400）。
     let req = Request::builder()
         .uri(format!("/api/v1/endpoints/{ep_id}/browse"))
         .method("POST")
@@ -268,18 +279,33 @@ async fn browse_sinumerik_nck_catalog_tree_e2e() {
         .body(Body::from(r#"{"parent":"nck://unknown","limit":10}"#))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
-    let v = assert_browse_ok(resp, "sinumerik-nck").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "未知 parent 必须报错，不得返回空页/根节点"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["error"]["code"], "UNKNOWN_PARENT",
+        "必须给出稳定错误码（Core 只透传，不改写）: {v}"
+    );
     assert!(
-        v["nodes"].as_array().expect("nodes 数组").is_empty(),
-        "未知 parent 必须为空页，实际: {v}"
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nck://unknown"),
+        "错误文案必须回显原始 parent: {v}"
     );
 
     // ---- 【PR-B 新增，不改写上面的既有断言】-------------------------------
     // 828d 的预填模板叶必须产出**语义载荷**：`{"kind":"nck_variable",
     // "parameters":{variable_id,definition_revision,target,arguments}}`，
     // 且**不含**任何原生协议字段（语义模式下用户不面对 `module`/`column`/…）。
-    // 既有的 `840d-sl` 断言（根 2 节点、诊断节点、未知 parent 空页）保持不变：
-    // 该系列没有模板，正是上面那三条断言成立的原因。
+    // 既有的 `840d-sl` 断言（根 2 节点、诊断节点、未知 parent → UNKNOWN_PARENT）
+    // 保持不变：该系列没有模板，正是上面那三条断言成立的原因。
     let (app828, ep828) = app_with_endpoint(
         "sinumerik-nck",
         serde_json::json!({"host":"127.0.0.1","family":"828d","local_tsap":256,"remote_tsap":258}),

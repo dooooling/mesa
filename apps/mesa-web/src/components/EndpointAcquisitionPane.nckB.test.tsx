@@ -15,7 +15,13 @@ import userEvent from "@testing-library/user-event";
 import { message } from "antd";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import { invokeDisabledButton } from "../test/bypassDisabled";
-import { catalogLeafIds, selectVariableViaTreeWith, selectedCatalogLeafIds } from "../test/catalogTreePick";
+import {
+  catalogLeafIds,
+  expandAllCatalogGroups,
+  selectVariableViaTreeWith,
+  selectedCatalogLeafIds,
+} from "../test/catalogTreePick";
+import { pickObject, probeResponse } from "../test/objectCascadePick";
 import { UNSUPPORTED_CONFIG_NOTICE } from "../descriptorCompatibility";
 import {
   CANONICAL_RESOURCES_KIND,
@@ -25,6 +31,7 @@ import {
   type ResourceSelection,
 } from "../deviceModel";
 import type { NckCatalogDefinition, NckDefinitionsResponse } from "../nckCatalog";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-nck";
@@ -62,6 +69,7 @@ function catDefinition(
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: `${variableId}@channel={channel}`,
     identity_keys: [{ path: "channel", required: true }],
     golden_ref: [{ entry: "nc_variable" }],
@@ -154,7 +162,18 @@ function installFetch(state: MockState) {
       });
     }
     if (url === `/api/v1/endpoints/${EP}/browse` || url === "/api/v1/endpoints/ep-2/browse") {
-      return ok({ nodes: state.browseNodes, next_cursor: null });
+      const browseBody = JSON.parse(String(init?.body ?? "{}")) as {
+        parent?: string;
+        cursor?: string;
+      };
+      const parent = browseBody.parent ?? "";
+      // 显式给定根页节点时（Browse 入口用例）只用它；否则服务驱动契约夹具，让联动
+      // 选择能按驱动真实树逐级取到实际对象（夹具只导出首页，后续页如实为空）。
+      if (state.browseNodes.length && parent === "") {
+        return ok({ nodes: state.browseNodes, next_cursor: null });
+      }
+      if ((browseBody.cursor ?? "") !== "") return ok({ nodes: [], next_cursor: null });
+      return probeResponse(parent);
     }
     if (url.startsWith("/api/v1/drivers/") && url.endsWith("/definitions/identity-preview")) {
       const body = JSON.parse(String(init?.body)) as {
@@ -243,6 +262,10 @@ async function waitVerified(count = 1) {
 async function openAddDrawer(user: ReturnType<typeof userEvent.setup>) {
   await user.click(await screen.findByTestId("add-point-entry"));
   await screen.findByTestId("catalog-tree");
+  // 变量下拉默认收起：打开面板并展开分组，后续用例才能看到变量行。
+  await user.click(screen.getByTestId("nck-variable-picker-trigger"));
+  await screen.findByTestId("catalog-tree-panel");
+  expandAllCatalogGroups();
 }
 
 /** 制造一次真实变更，让固定保存区出现。 */
@@ -284,10 +307,10 @@ describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面
         "": catEnvelope({
           total: 3,
           limit: 2,
-          next_cursor: "v1-syn.collect.b-1",
-          definitions: [catDefinition("syn.collect.a"), catDefinition("syn.collect.b")],
+          next_cursor: "v1-channel.feed.commanded-1",
+          definitions: [catDefinition("channel.feed.actual"), catDefinition("channel.feed.commanded")],
         }),
-        "v1-syn.collect.b-1": catEnvelope({
+        "v1-channel.feed.commanded-1": catEnvelope({
           total: 3,
           limit: 2,
           next_cursor: null,
@@ -301,16 +324,16 @@ describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面
     // 目录统计不在默认页面上（§2.5），打开抽屉后才是选择器的信息区。
     await waitFor(() => expect(screen.queryByTestId("nck-collectable-summary")).toBeNull());
     await openAddDrawer(user);
-    const summary = await screen.findByTestId("nck-collectable-summary");
-    expect(summary.textContent).toContain("2 个可配置变量");
+    const count = await screen.findByTestId("nck-collectable-count");
+    expect(count.textContent).toContain("可添加 2 个 · 暂缓 0 个");
     expect(screen.getByTestId("nck-catalog-meta").textContent).toContain("3 条 / 2 页");
     // 两页都读了：cursor 逐字回传。
     expect(state.catalogCalls).toHaveLength(2);
-    expect(state.catalogCalls[1]).toContain("cursor=v1-syn.collect.b-1");
+    expect(state.catalogCalls[1]).toContain("cursor=v1-channel.feed.commanded-1");
     // 树上可见叶子 = 可提供的变量集合（原「下拉框 option 集合」的等价口径）。
     const leafIds = catalogLeafIds();
-    expect(leafIds).toContain("syn.collect.a");
-    expect(leafIds).toContain("syn.collect.b");
+    expect(leafIds).toContain("channel.feed.actual");
+    expect(leafIds).toContain("channel.feed.commanded");
     // identity 条目不得出现在可采集选择列表（不是禁用，而是不提供）。
     expect(leafIds).not.toContain("syn.identity.a");
   });
@@ -327,14 +350,15 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
         driverId={NCK_DRIVER}
         onChanged={() => {}}
         nckDefinitions={{
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -350,10 +374,10 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
     expect(screen.getByTestId("drawer-draft-notice").textContent).toBe(
       "确认后加入页面草稿，保存配置后生效。",
     );
-    // 未选资源时只显示一个选择入口：没有空身份、禁用按钮与错误框的组合。
-    expect(screen.queryByTestId("nck-add-point")).toBeNull();
-    await selectVariableViaTreeWith(user, "syn.collect.a");
-    await user.type(screen.getByLabelText("target-channel"), "1");
+    // 未选资源时只显示一个选择入口：添加按钮在场但禁用，没有空身份与错误框。
+    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+    await selectVariableViaTreeWith(user, "channel.feed.actual");
+    await pickObject("channel", "通道1");
     await screen.findByTestId("nck-point-key");
     // 按钮文案是「加入待保存列表」，不是「保存点位」（§4.1-7）。
     expect(screen.getByTestId("nck-add-point").textContent).toBe("加入待保存列表");
@@ -375,9 +399,9 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
     expect(points).toHaveLength(1);
     expect(points[0]).toEqual({
       kind: "nck_variable",
-      point_key: "syn.collect.a@channel=1",
+      point_key: "channel.feed.actual@channel=1",
       parameters: {
-        variable_id: "syn.collect.a",
+        variable_id: "channel.feed.actual",
         definition_revision: 1,
         target: { channel: 1 },
         arguments: {},
@@ -391,7 +415,7 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
 describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding", () => {
   it("editing_existing_task_keeps_other_tasks_and_never_adds_generic_binding", async () => {
     const user = userEvent.setup();
-    const p1 = point("syn.collect.a", { channel: 1 });
+    const p1 = point("channel.feed.actual", { channel: 1 });
     const selections: ResourceSelection[] = [
       {
         resource_id: "variable",
@@ -412,23 +436,25 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
         driverId={NCK_DRIVER}
         onChanged={() => {}}
         nckDefinitions={{
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
-          "syn.collect.b": {
-            variable_id: "syn.collect.b",
+          "channel.feed.commanded": {
+            variable_id: "channel.feed.commanded",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -440,8 +466,8 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
 
     // 在同一个 NCK 任务里新增第二个点位（抽屉入口）。
     await openAddDrawer(user);
-    await selectVariableViaTreeWith(user, "syn.collect.b");
-    await user.type(screen.getByLabelText("target-channel"), "2");
+    await selectVariableViaTreeWith(user, "channel.feed.commanded");
+    await pickObject("channel", "通道2");
     await screen.findByTestId("nck-point-key");
     await user.click(screen.getByTestId("nck-add-point"));
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(2));
@@ -465,7 +491,7 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
 
   it("editing_a_point_replaces_identity_after_server_preview_and_keeps_task_id", async () => {
     const user = userEvent.setup();
-    const original = point("syn.collect.a", { channel: 1 });
+    const original = point("channel.feed.actual", { channel: 1 });
     const state = mkState({ tasks: [nckTask("nck-task", [original])] });
     installFetch(state);
     render(
@@ -474,14 +500,15 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
         driverId={NCK_DRIVER}
         onChanged={() => {}}
         nckDefinitions={{
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -493,11 +520,13 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
     await user.click(within(rowOf(original.point_key)).getByTestId("point-row-edit"));
     await screen.findByTestId("catalog-tree");
     expect(screen.getByTestId("nck-add-point").textContent).toBe("确认修改");
-    const input = screen.getByLabelText("target-channel") as HTMLInputElement;
-    await user.clear(input);
-    await user.type(input, "3");
+    // 编辑态：已选对象以"已选"标签呈现（没有可键入的输入框）；重新选择另一台实际
+    // 对象后，身份由驱动载荷自动改写（不是手填出来的）。
+    expect(screen.getByTestId("nck-object-selected-channel").getAttribute("data-value")).toBe("1");
+    fireEvent.click(screen.getByTestId("nck-object-reselect-channel"));
+    await pickObject("channel", "通道2");
     await waitFor(() =>
-      expect(screen.getByTestId("nck-point-key").textContent).toBe("syn.collect.a@channel=3"),
+      expect(screen.getByTestId("nck-point-key").textContent).toBe("channel.feed.actual@channel=2"),
     );
     await user.click(screen.getByTestId("nck-add-point"));
     await waitFor(() =>
@@ -520,7 +549,7 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
     expect(sent[0].id).toBe("nck-task");
     const points = (sent[0].binding.config as { points: NckPointSelection[] }).points;
     expect(points).toHaveLength(1);
-    expect(points[0].point_key).toBe("syn.collect.a@channel=3");
+    expect(points[0].point_key).toBe("channel.feed.actual@channel=2");
   });
 });
 
@@ -530,7 +559,7 @@ describe("门禁 9：存量 identity 点位 → 显式移除 → 重验剩余 �
     const identityPoint = point("syn.identity.a", { channel: 9 });
     // identity 点位的参数形状按定义（axis），这里故意用 channel 也不影响：
     // 准入失败发生在参数校验之前，证明「删除不经准入门」不是靠参数碰巧合法。
-    const collectPoint = point("syn.collect.a", { channel: 1 });
+    const collectPoint = point("channel.feed.actual", { channel: 1 });
     const state = mkState({ tasks: [nckTask("nck-task", [identityPoint, collectPoint])] });
     installFetch(state);
     render(
@@ -547,15 +576,17 @@ describe("门禁 9：存量 identity 点位 → 显式移除 → 重验剩余 �
             targets: ["axis"],
             target_required: ["axis"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -609,7 +640,7 @@ describe("门禁 9：存量 identity 点位 → 显式移除 → 重验剩余 �
 
 describe("门禁 6：已有点位预览失败 ⇒ 不得按旧 Key 继续提交", () => {
   it("existing_point_with_failed_preview_blocks_save_with_reason", async () => {
-    const p = point("syn.collect.a", { channel: 1 });
+    const p = point("channel.feed.actual", { channel: 1 });
     const state = mkState({ tasks: [nckTask("nck-task", [p])], previewFails: true });
     installFetch(state);
     render(
@@ -618,14 +649,15 @@ describe("门禁 6：已有点位预览失败 ⇒ 不得按旧 Key 继续提交"
         driverId={NCK_DRIVER}
         onChanged={() => {}}
         nckDefinitions={{
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -643,14 +675,15 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
     const state = mkState();
     installFetch(state);
     const definitions = {
-      "syn.collect.a": {
-        variable_id: "syn.collect.a",
+      "channel.feed.actual": {
+        variable_id: "channel.feed.actual",
         revision: 1,
         family: "828d",
         scope: "collect",
         targets: ["channel"],
         target_required: ["channel"],
         arguments: [],
+        availability: CANDIDATE_AVAILABILITY,
       },
     };
     const { rerender } = render(
@@ -662,8 +695,8 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
       />,
     );
     await openAddDrawer(user);
-    await selectVariableViaTreeWith(user, "syn.collect.a");
-    await user.type(screen.getByLabelText("target-channel"), "1");
+    await selectVariableViaTreeWith(user, "channel.feed.actual");
+    await pickObject("channel", "通道1");
     await screen.findByTestId("nck-point-key");
 
     rerender(
@@ -680,8 +713,9 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
     // 重建后的表单未选中任何变量（树上没有任何叶子处于选中态）。
     expect(selectedCatalogLeafIds()).toEqual([]);
     expect(screen.queryByTestId("nck-point-key")).toBeNull();
-    // 未重新选择变量 ⇒ 不渲染任何 Target 输入（上一台的输入已随卸载丢弃）。
-    expect(screen.queryByLabelText("target-channel")).toBeNull();
+    // 未重新选择变量 ⇒ 不渲染级联下拉（上一台的对象选择已随卸载丢弃）。
+    expect(screen.queryByTestId("nck-object-cascade")).toBeNull();
+    expect(screen.queryByTestId("nck-object-select-channel")).toBeNull();
   });
 });
 
@@ -733,14 +767,15 @@ describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）
         driverId={NCK_DRIVER}
         onChanged={() => {}}
         nckDefinitions={{
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -803,14 +838,15 @@ describe("P1：Endpoint 层最终保存守卫（完整 Schema）", () => {
         driverId={NCK_DRIVER}
         onChanged={() => {}}
         nckDefinitions={{
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -849,97 +885,10 @@ describe("P1：Endpoint 层最终保存守卫（完整 Schema）", () => {
   });
 });
 
-describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）", () => {
-  it("semantic_browse_prefills_form_and_identity_leaf_is_blocked", async () => {
+describe("添加抽屉：移除独立 Browse 入口，联动选择是唯一路径", () => {
+  it("drawer_has_no_browse_entry_and_identity_is_never_offered", async () => {
     const user = userEvent.setup();
-    const collectNode = {
-      id: "browse.collect",
-      label: "Browse 程序状态",
-      kind: "nck_variable",
-      has_children: false,
-      // IPC 1.8：可选性/载荷/诊断由**驱动**给出（不再由前端查目录推断）。
-      selection_mode: 2, // SEMANTIC
-      selection_payload_json: JSON.stringify({
-        kind: "nck_variable",
-        parameters: {
-          variable_id: "syn.collect.a",
-          definition_revision: 1,
-          target: { channel: 1 },
-          arguments: {},
-        },
-        identity: {
-          template: "syn.collect.a@channel={channel}",
-          keys: [{ path: "channel", required: true }],
-          preview_point_key: "syn.collect.a@channel=1",
-        },
-      }),
-      diagnostics: [
-        {
-          code: "IDENTITY_PREVIEW",
-          message: "Browse 预览：syn.collect.a@channel=1（仅展示；提交前仍需服务端确认）",
-          severity: 1,
-        },
-      ],
-      binding_json: JSON.stringify({
-        kind: "nck_variable",
-        parameters: {
-          variable_id: "syn.collect.a",
-          definition_revision: 1,
-          target: { channel: 1 },
-          arguments: {},
-        },
-        identity: {
-          template: "syn.collect.a@channel={channel}",
-          keys: [{ path: "channel", required: true }],
-          preview_point_key: "syn.collect.a@channel=1",
-        },
-      }),
-    };
-    const identityNode = {
-      id: "browse.identity",
-      label: "Browse 身份探针",
-      kind: "nck_variable",
-      has_children: false,
-      // 驱动已按 scope=identity 判为不可选，并把稳定码写进诊断。
-      selection_mode: 3, // NOT_SELECTABLE
-      selection_payload_json: JSON.stringify({
-        kind: "nck_variable",
-        parameters: {
-          variable_id: "syn.identity.a",
-          definition_revision: 1,
-          target: { axis: 1 },
-          arguments: {},
-        },
-        identity: {
-          template: "syn.identity.a@axis={axis}",
-          keys: [{ path: "axis", required: true }],
-          preview_point_key: "syn.identity.a@axis=1",
-        },
-      }),
-      diagnostics: [
-        {
-          code: "DEFINITION_SCOPE_NOT_COLLECTABLE",
-          message:
-            "定义 `syn.identity.a` revision=1 的 scope=`identity` 不可采集（仅 scope=`collect` 允许进入采集计划）",
-          severity: 3,
-        },
-      ],
-      binding_json: JSON.stringify({
-        kind: "nck_variable",
-        parameters: {
-          variable_id: "syn.identity.a",
-          definition_revision: 1,
-          target: { axis: 1 },
-          arguments: {},
-        },
-        identity: {
-          template: "syn.identity.a@axis={axis}",
-          keys: [{ path: "axis", required: true }],
-          preview_point_key: "syn.identity.a@axis=1",
-        },
-      }),
-    };
-    const state = mkState({ browseNodes: [collectNode, identityNode] });
+    const state = mkState();
     installFetch(state);
     render(
       <EndpointAcquisitionPane
@@ -947,14 +896,15 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
         driverId={NCK_DRIVER}
         onChanged={() => {}}
         nckDefinitions={{
-          "syn.collect.a": {
-            variable_id: "syn.collect.a",
+          "channel.feed.actual": {
+            variable_id: "channel.feed.actual",
             revision: 1,
             family: "828d",
             scope: "collect",
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
           "syn.identity.a": {
             variable_id: "syn.identity.a",
@@ -964,31 +914,27 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
             targets: ["axis"],
             target_required: ["axis"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
     );
-    // 浏览入口在抽屉里，且必须由驱动声明（resource_selection_methods 含 browse）。
     await openAddDrawer(user);
-    await user.click(screen.getByTestId("nck-browse-toggle"));
-    await screen.findByText("Browse 程序状态");
+    // 驱动即使声明了 browse，抽屉里也不再出现独立的浏览操作入口。
+    expect(screen.queryByTestId("nck-browse-toggle")).toBeNull();
+    expect(screen.queryByText("从浏览树选择语义变量")).toBeNull();
+    // 变量选择只剩紧凑树形下拉；identity 条目（scope=identity）不进入可选项。
+    expect(screen.getByTestId("nck-variable-picker-trigger")).toBeTruthy();
+    expect(catalogLeafIds()).not.toContain("syn.identity.a");
 
-    // A13：identity 叶必须由**驱动**给出具体不可选原因，且没有“选用（语义）”。
-    const identityRow = screen.getByText("Browse 身份探针").closest("div") as HTMLElement;
-    expect(within(identityRow).getByTestId("browse-selection-block").textContent).toContain(
-      "DEFINITION_SCOPE_NOT_COLLECTABLE",
-    );
-    expect(within(identityRow).queryByRole("button", { name: /选用（语义）/ })).toBeNull();
-
-    // A1/A16：collect 叶可进入语义表单；Browse 预览只展示，提交前重新 Preview。
-    const collectRow = screen.getByText("Browse 程序状态").closest("div") as HTMLElement;
-    await user.click(within(collectRow).getByRole("button", { name: /选用（语义）/ }));
-    // 语义表单里的「已选变量」由树上叶子的选中态体现（平铺下拉框已移除）。
-    await waitFor(() => expect(selectedCatalogLeafIds()).toEqual(["syn.collect.a"]));
-    expect((screen.getByLabelText("target-channel") as HTMLInputElement).value).toBe("1");
+    // 联动选择：选中 collect 变量 → 只出现它真正需要的一级对象 → 预览 → 加入草稿。
+    await selectVariableViaTreeWith(user, "channel.feed.actual");
+    expect(screen.getAllByTestId(/^nck-object-select-/)).toHaveLength(1);
+    await pickObject("channel", "通道1");
     await screen.findByTestId("nck-point-key");
-    expect(screen.getByTestId("nck-point-key").textContent).toBe("syn.collect.a@channel=1");
+    expect(screen.getByTestId("nck-point-key").textContent).toBe("channel.feed.actual@channel=1");
     await user.click(screen.getByTestId("nck-add-point"));
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1));
+    expect(state.putBodies).toHaveLength(0);
   });
 });

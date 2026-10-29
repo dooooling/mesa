@@ -66,6 +66,9 @@ regex = "1"
 # 全角 `Ａ`(U+FF21) → `A` 等语义不同的文本折叠成同一 Key，制造身份碰撞。
 unicode-normalization = { version = "=0.1.25", default-features = false }
 sha2 = "0.10"
+# sidecar 元数据与 `r1.json` 的绑定摘要是 git blob id（SHA-1），装载期必须自算一遍
+# 才能证明 sidecar 描述的确实是当前定义（见 definition.rs 的 `git_blob_sha1`）。
+sha1 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

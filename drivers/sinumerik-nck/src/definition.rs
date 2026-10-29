@@ -47,6 +47,14 @@ pub const MIN_DEFINITION_REVISION: u32 = 1;
 pub const EMBEDDED_DEFINITIONS_828D_R1: &str = include_str!("../definitions/828d/r1.json");
 /// 内嵌摘要清单（已发布 `(variable_id, revision)` 的 canonical-JSON SHA-256）。
 pub const EMBEDDED_DEFINITIONS_828D_LOCK: &str = include_str!("../definitions/828d/DIGESTS.lock");
+/// 内嵌 sidecar 元数据（单位 / 手册位置 / 索引规则 / 可用性判定）。
+///
+/// 为什么内嵌而不是运行期读文件：与上面两份同源数据保持**同一个失败时刻**。
+/// `include_str!` 让「文件缺失」变成编译错误；而「文件存在但内容与 r1.json 不匹配」
+/// 由装载期摘要绑定检查兜住（见 `definition_api::DefinitionMeta::load`）。
+/// 二者合起来满足 fail-closed：任何一条不成立，目录整体不可用。
+pub const EMBEDDED_DEFINITIONS_828D_R1_META: &str =
+    include_str!("../definitions/828d/r1.meta.json");
 
 /// 定义适用范围：`Collect` 出现在用户点位面；`Identity` 只服务身份探针。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +347,15 @@ pub enum CatalogError {
     UnexpectedLockEntry { variable_id: String, revision: u32 },
     #[error("摘要清单非法：{0}")]
     LockJson(String),
+    /// sidecar 元数据（`r1.meta.json`）非法：形状不对、与 `r1.json` 的绑定摘要不符、
+    /// 或与定义集合不能双向对上。
+    ///
+    /// NOTE：这里**不**新增对外错误码——它和上面各变体同属「构建期/发布数据问题」，
+    /// 统一映射为 `DEFINITION_DIGEST_MISMATCH`（`Internal` ⇒ 503）。新增码会破坏
+    /// 边界文档 §3.5 的「码 → kind 唯一」冻结表，而 sidecar 不符与摘要不符对调用方
+    /// 而言是同一种失败：这份目录不可用。
+    #[error("定义 sidecar 元数据非法：{0}")]
+    MetaInvalid(String),
 }
 
 impl CatalogError {
@@ -621,6 +638,27 @@ impl DefinitionCatalog {
         hasher.update(text.as_bytes());
         Ok(format!("{:x}", hasher.finalize()))
     }
+}
+
+/// 按 **git blob** 语义计算一段文本的 SHA-1（`sha1("blob <字节数>\0" + 内容)`）。
+///
+/// 为什么需要它：sidecar 的 `binds_to.definition_blob_sha1` 记录的是 `r1.json`
+/// 在 git 里的 blob id（`git hash-object` 的输出），这是仓库里唯一与提交内容
+/// 一一对应的度量。装载期必须自己算一遍才能证明「这份 sidecar 描述的确实是当前
+/// 这份定义」，否则 sidecar 与定义会在无人察觉时漂移。
+///
+/// 为什么先做 CRLF → LF 归一：Windows 工作树是 CRLF（`core.autocrlf=true`），而
+/// git 里的 blob 是 LF。`include_str!` 嵌入的是**工作树字节**，不归一就会在
+/// Windows 上算出与 Linux 不同的摘要，让同一份数据在两平台得出不同结论。
+/// 这也与本仓 `tools/ci/*.py` 里「raw/lf 双候选」的判定口径一致。
+pub fn git_blob_sha1(text: &str) -> String {
+    use sha1::{Digest, Sha1};
+
+    let normalized = text.replace("\r\n", "\n");
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", normalized.len()).as_bytes());
+    hasher.update(normalized.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// 递归 canonical 化：对象键按**字节序**升序，数组保序，`null` 不出现。

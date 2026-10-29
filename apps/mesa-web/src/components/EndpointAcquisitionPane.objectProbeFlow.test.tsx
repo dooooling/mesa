@@ -1,17 +1,26 @@
-// 流程级验收：**真实渲染 + 请求探针**的「选变量 → 选实际对象 → 预览 → 添加 → 保存」。
+// 流程级验收：**真实渲染 + 请求探针**的「选变量 → 逐级选实际对象 → 自动填参 →
+// 预览 → 添加 → 保存」。
 //
 // 为什么必须单独一个流程级文件（而不是继续加纯模型单测）：
-// `catalogTree.ts`（分类建树）与 `objectProbe.ts`（对象探测/填参）各自已被单测覆盖，
-// 但单测只能证明"函数返回正确"，不能证明"界面上真的按这条流程走"——两模块接进
-// 采集抽屉后，中间还隔着表单校验、身份指纹失效、服务端预览、草稿差异与保存门。
-// 任一环节接线错位（例如探测请求体写成 `parent_id`、填参后旧 point_key 没失效、
-// 失败被渲染成空列表），纯模型单测全绿而用户实际走不通。本文件因此只做一件事：
-// 用离线 mock 驱动真实组件，断言**交互路径**与**请求顺序/载荷**。
+// `catalogTree.ts`（分类建树）与 `objectCascade.ts`（联动选择/缺参数判定）各自已被
+// 单测覆盖，但单测只能证明"函数返回正确"，不能证明"界面上真的按这条流程走"——
+// 两模块接进采集抽屉后，中间还隔着表单校验、身份指纹失效、服务端预览、草稿差异与
+// 保存门。任一环节接线错位（例如探测请求体写成 `parent_id`、填参后旧 point_key 没
+// 失效、失败被渲染成空下拉），纯模型单测全绿而用户实际走不通。
+//
+// **树 id 与节点形状来自驱动，不来自本文件**：Browse 响应体逐字来自驱动产出的契约
+// 夹具 `src/test/nckIdentityProbeContract.json`（由
+// `drivers/sinumerik-nck/tests/identity_probe_trees.rs` 在回环脚手架上真实浏览后
+// 生成，驱动一变夹具就对不上而红）。本文件只按**标签关键字**在夹具里找节点，
+// 找不到就抛错——不再手写任何树 id。
+//
+// 形态已收敛：语义页**没有** Target/Arguments 输入框，参数只能来自驱动载荷；
+// 拿不到所需参数时明确提示并阻断（不回退手填、不填默认值）。
 //
 // 约束（与验收口径一致）：
 // - 纯离线：不启服务、不连真机、不改配置、不碰生产库；全部请求由本文件 mock；
 // - 判定可机械核实：请求标签序列、请求体字段、DOM 文本、按钮可用性；
-// - 通用组件零厂商判断：本文件只喂数据，不依赖任何前端厂商分支（见报告 §6）。
+// - 通用组件零厂商判断：本文件只喂数据，不依赖任何前端厂商分支。
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -21,18 +30,100 @@ import { createRequestProbe, installProbedFetch } from "../test/requestProbe";
 import { NATIVE_RESOURCE } from "../test/acquisitionFixture238";
 import type { AcquisitionTaskShape, NckPointSelection } from "../deviceModel";
 import type { ResourceDescriptor } from "../types";
+import contract from "../test/nckIdentityProbeContract.json";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
+import { cascadeOptions, openCascade, pickObject } from "../test/objectCascadePick";
+import {
+  expandAllCatalogGroups,
+  openVariablePicker,
+  selectVariableViaTreeWith,
+} from "../test/catalogTreePick";
 
 const EP = "ep-flow";
 const DRIVER = "sinumerik-nck";
-const AXES = "nck://identity/axes";
-const CHANNELS = "nck://identity/channels";
-const OBJECTS = "nck://identity/objects";
-const axisId = (n: number) => `${AXES}/${n}`;
-const channelId = (n: number) => `${CHANNELS}/${n}`;
-const objectId = (n: number) => `${OBJECTS}/${n}`;
 
 // ---------------------------------------------------------------------------
-// 1. 目录：六条定义（四类各一条 + 两种"待分类"）
+// 0. 驱动产出的 Browse 契约（树 id / 选择模式 / 载荷 / 诊断码全部来自驱动）
+// ---------------------------------------------------------------------------
+
+type ContractNode = Record<string, unknown>;
+interface ContractPage {
+  nodes: ContractNode[];
+  next_cursor: string | null;
+}
+
+const CONTRACT = contract as unknown as {
+  family: string;
+  pages: Record<string, ContractPage>;
+};
+
+/** 某一 parent 的真实响应体；驱动没有这棵树时返回空页（与驱动行为一致：不伪造）。 */
+function pageOf(parent: string): ContractPage {
+  return CONTRACT.pages[parent] ?? { nodes: [], next_cursor: null };
+}
+
+const idOf = (node: ContractNode): string => String(node.id);
+const labelOf = (node: ContractNode): string => String(node.label ?? "");
+
+/** 在夹具里按标签关键字找节点：找不到就失败（说明驱动的树变了，必须重生成夹具）。 */
+function nodeByLabel(parent: string, keyword: string): ContractNode {
+  const node = pageOf(parent).nodes.find((candidate) => labelOf(candidate).includes(keyword));
+  if (!node) {
+    throw new Error(`驱动契约里没有「${keyword}」节点（parent=${parent}）：请重生成 nckIdentityProbeContract.json`);
+  }
+  return node;
+}
+
+/** 根页的两个入口（模板目录 + 身份核对）都由驱动给出。 */
+const PRESETS_ROOT = idOf(nodeByLabel("", "常用预设模板"));
+const IDENTITY_ROOT = idOf(nodeByLabel("", "轴与驱动对象"));
+/** 身份根下的四棵树（轴/通道/主轴/驱动对象）都由驱动给出。 */
+const AXES = idOf(nodeByLabel(IDENTITY_ROOT, "机床轴"));
+const CHANNELS = idOf(nodeByLabel(IDENTITY_ROOT, "通道"));
+const SPINDLES = idOf(nodeByLabel(IDENTITY_ROOT, "主轴"));
+const OBJECTS = idOf(nodeByLabel(IDENTITY_ROOT, "驱动对象"));
+
+/**
+ * early-stop 后的**首次访问序列**（广度优先，顺序由驱动树的节点顺序决定）。
+ *
+ * 为什么逐条钉住：探测必须"遍历目录找能提供参数的节点"，而不是猜某一棵固定子树；
+ * 少扫一个分支就可能把"设备上有"显示成"没有"。同时，所有必填 key 都有候选后
+ * 必须停止 BFS：channel 场景停在 channels，spindle 场景停在 spindles，
+ * axis 场景停在 channels（axis 页先给出 axis，channels 页再给出 channel）。
+ */
+const SCAN_ORDER_CHANNEL = ["", PRESETS_ROOT, IDENTITY_ROOT, AXES, CHANNELS];
+const SCAN_ORDER_SPINDLE = [...SCAN_ORDER_CHANNEL, SPINDLES];
+const SCAN_ORDER_AXIS = SCAN_ORDER_CHANNEL;
+
+/**
+ * 一次探测里**首次访问**的 parent 顺序。
+ *
+ * 分页会让同一个 parent 出现多次（夹具只导出首页，后续页为空），因此这里取
+ * "首次出现"的顺序：它才是广度优先遍历的真实路径。
+ */
+function firstVisits(state: FlowState): string[] {
+  const parents = state.browseLog.map((entry) => entry.parent);
+  return parents.filter((parent, index) => parents.indexOf(parent) === index);
+}
+
+/** 通道/主轴实例节点：按驱动标签定位（实例号在标签里，id 也来自夹具）。 */
+function channelNode(n: number): ContractNode {
+  const node = pageOf(CHANNELS).nodes.find((candidate) => labelOf(candidate).startsWith(`通道${n}`));
+  if (!node) throw new Error(`驱动契约里没有通道${n}`);
+  return node;
+}
+function spindleNode(n: number): ContractNode {
+  const node = pageOf(SPINDLES).nodes.find((candidate) => labelOf(candidate).startsWith(`主轴${n}`));
+  if (!node) throw new Error(`驱动契约里没有主轴${n}`);
+  return node;
+}
+/** 通道页里"无法判定"的诊断节点（驱动用稳定码标出来的）。 */
+const CHANNEL_PENDING = pageOf(CHANNELS).nodes.find(
+  (node) => node.kind === "diagnostic",
+) as ContractNode;
+
+// ---------------------------------------------------------------------------
+// 1. 目录：八条定义（四类各若干 + 两种"待分类" + 模板目录条目）
 // ---------------------------------------------------------------------------
 
 /**
@@ -52,6 +143,7 @@ function definitionOf(overrides: Record<string, unknown>): Record<string, unknow
     targets: [],
     target_required: [],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: "",
     identity_keys: [],
     golden_ref: [],
@@ -61,22 +153,39 @@ function definitionOf(overrides: Record<string, unknown>): Record<string, unknow
   };
 }
 
-/** 轴/通道两个实例坐标的语义变量（探测轴列表后填 axis+channel）。 */
+/** 轴/通道两个实例坐标的语义变量（只用于"入口按需出现"的对照）。 */
 const AXIS_DEF = definitionOf({
   variable_id: "axis.position.actual_bcs",
   label: { zh: "轴实际位置", en: "Axis actual position" },
   category: "cnc_variable",
-  targets: ["axis", "channel"],
-  target_required: ["axis", "channel"],
+  // 与真实目录一致：targets 顺序是 channel → axis（UI 也按此顺序出现），
+  // identity_template 则是轴在前（服务端身份模板的既有顺序）。
+  targets: ["channel", "axis"],
+  target_required: ["channel", "axis"],
   identity_keys: [
-    { path: "axis", required: true },
     { path: "channel", required: true },
+    { path: "axis", required: true },
   ],
   identity_template: "axis.position.actual_bcs@axis=i:{axis},channel=i:{channel}",
   digest: "digest-axis",
 });
 
-/** 单通道语义变量：证明"需要哪些对象"完全来自定义数据（只需 channel）。 */
+/** 轴指令位置：与 axis.position.actual_bcs 同形，验证两条 collect 轴定义都能走通。 */
+const AXIS_CMD_DEF = definitionOf({
+  variable_id: "axis.position.commanded_mcs",
+  label: { zh: "轴指令位置", en: "Axis commanded position" },
+  category: "cnc_variable",
+  targets: ["channel", "axis"],
+  target_required: ["channel", "axis"],
+  identity_keys: [
+    { path: "channel", required: true },
+    { path: "axis", required: true },
+  ],
+  identity_template: "axis.position.commanded_mcs@axis=i:{axis},channel=i:{channel}",
+  digest: "digest-axis-cmd",
+});
+
+/** 单通道语义变量：只需要 channel ⇒ 通道树一个节点就能填满（用例 1）。 */
 const FEED_DEF = definitionOf({
   variable_id: "channel.feed.actual",
   label: { zh: "进给速度", en: "Feed rate" },
@@ -88,7 +197,22 @@ const FEED_DEF = definitionOf({
   digest: "digest-feed",
 });
 
-/** 驱动参数（搜索"actual"跨分类命中的第二类）。 */
+/** 主轴转速：需要 channel + spindle ⇒ 两级下拉各选一个（用例 2）。 */
+const SPINDLE_DEF = definitionOf({
+  variable_id: "spindle.speed.actual",
+  label: { zh: "主轴实际转速", en: "Spindle actual speed" },
+  category: "system_variable",
+  targets: ["channel", "spindle"],
+  target_required: ["channel", "spindle"],
+  identity_keys: [
+    { path: "channel", required: true },
+    { path: "spindle", required: true },
+  ],
+  identity_template: "spindle.speed.actual@channel=i:{channel},spindle=i:{spindle}",
+  digest: "digest-spindle",
+});
+
+/** 驱动参数（搜索"actual"跨分类命中的第三类）。 */
 const DRIVE_DEF = definitionOf({
   variable_id: "drive.temperature",
   label: { zh: "驱动温度", en: "Drive temperature" },
@@ -100,7 +224,7 @@ const DRIVE_DEF = definitionOf({
   digest: "digest-drive",
 });
 
-/** 不声明 targets 的条目：不出现"选择实际对象"入口（入口按需出现）。 */
+/** 不声明 targets 的条目：不出现级联下拉（入口按需出现）。 */
 const MODE_DEF = definitionOf({
   variable_id: "machine_data.mode",
   label: { zh: "运行方式", en: "Operation mode" },
@@ -112,12 +236,13 @@ const MODE_DEF = definitionOf({
 
 /** 驱动**明确** unclassified：可见、标注未知、但不得作为可采集提交。 */
 const DEAD_DEF = definitionOf({
-  variable_id: "dead.variable.probe",
+  variable_id: "channel.feed.override",
   label: { zh: "未登记变量", en: "Unregistered variable" },
   category: "unclassified",
   targets: ["channel"],
   target_required: ["channel"],
-  identity_template: "dead.variable.probe@channel=i:{channel}",
+  identity_keys: [{ path: "channel", required: true }],
+  identity_template: "channel.feed.override@channel=i:{channel}",
   digest: "digest-dead",
 });
 
@@ -131,123 +256,39 @@ const LEGACY_DEF = definitionOf({
   digest: "digest-mystery",
 });
 
-const CATALOG = [AXIS_DEF, FEED_DEF, DRIVE_DEF, MODE_DEF, DEAD_DEF, LEGACY_DEF];
-
-// ---------------------------------------------------------------------------
-// 2. 真机形状的 Browse 节点（字段名/取值一律照抄 wire 事实）
-// ---------------------------------------------------------------------------
-
-/** 语义叶载荷：只有驱动给的对象坐标，前端不补任何键。 */
-function payloadOf(target: Record<string, unknown>, keys: Array<{ path: string; required: boolean }>): string {
-  return JSON.stringify({
-    identity: { keys, template: "…@axis={axis},channel={channel}" },
-    parameters: { target, arguments: {} },
-  });
-}
-
 /**
- * 根节点：三个可下钻分组。
+ * 模板目录里的条目（`axis.ctrlout.module_number`）。
  *
- * `nck://identity/axes` 故意声明 `selection_mode = 3`（分支不可选）并带一条
- * severity=2 的诊断：证明"分支节点不会被误当成可选对象"。
+ * 合成定义用 `collect` 是为了让它出现在树上（真实目录里该变量是
+ * `scope=identity`，会在可采集过滤阶段被排除）；驱动对模板叶仍会给出
+ * `DEFINITION_SCOPE_NOT_COLLECTABLE` 诊断。本用例只验证：没有实例号的模板
+ * 只能作为**不可用候选**出现在 axis 那一级——可见、带码，但选不了。
  */
-const ROOT_NODES = [
-  {
-    id: AXES,
-    kind: "identity_group",
-    label: "轴（8 个）",
-    has_children: true,
-    selection_mode: 3,
-    diagnostics: [
-      { code: "IDENTITY_GROUP_CONTAINER", message: "分组节点只用于下钻，本身不是可选对象", severity: 2 },
-    ],
-  },
-  { id: CHANNELS, kind: "identity_group", label: "通道（8 个）", has_children: true, selection_mode: 0 },
-  { id: OBJECTS, kind: "identity_group", label: "驱动对象（8 个候选）", has_children: true, selection_mode: 0 },
+const CTRLOUT_DEF = definitionOf({
+  variable_id: "axis.ctrlout.module_number",
+  label: { zh: "控制输出模块号", en: "Ctrlout module number" },
+  category: "cnc_variable",
+  targets: ["axis"],
+  target_required: ["axis"],
+  identity_keys: [{ path: "axis", required: true }],
+  identity_template: "axis.ctrlout.module_number@axis=i:{axis}",
+  digest: "digest-ctrlout",
+});
+
+const CATALOG = [
+  AXIS_DEF,
+  AXIS_CMD_DEF,
+  FEED_DEF,
+  SPINDLE_DEF,
+  DRIVE_DEF,
+  MODE_DEF,
+  DEAD_DEF,
+  LEGACY_DEF,
+  CTRLOUT_DEF,
 ];
 
-/**
- * 8 个轴：轴 6 是**未确认**形态（`has_children=false` + 无载荷 + label 含"未确认"），
- * 与真机 `MB1` 轴 6 一致；其余 7 轴带 `selection_mode=2` 的语义载荷。
- */
-const AXIS_NODES = Array.from({ length: 8 }, (_, index) => {
-  const n = index + 1;
-  if (n === 6) {
-    return {
-      id: axisId(6),
-      kind: "nck_variable",
-      label: "轴 6 · MB1（未确认：未分配有效驱动输出）",
-      has_children: false,
-      selection_mode: 0,
-    };
-  }
-  return {
-    id: axisId(n),
-    kind: "nck_variable",
-    label: `轴 ${n} · MB1`,
-    has_children: false,
-    selection_mode: 2,
-    selection_payload_json: payloadOf({ axis: n, channel: 1 }, [
-      { path: "axis", required: true },
-      { path: "channel", required: true },
-    ]),
-  };
-});
-
-const CHANNEL_NODES = Array.from({ length: 8 }, (_, index) => {
-  const n = index + 1;
-  return {
-    id: channelId(n),
-    kind: "nck_variable",
-    label: `通道 ${n}`,
-    has_children: false,
-    selection_mode: 2,
-    selection_payload_json: payloadOf({ channel: n }, [{ path: "channel", required: true }]),
-  };
-});
-
-/**
- * 8 个候选驱动对象：第 3 个被驱动**明确**拒绝（`selection_mode=3` + severity=3 诊断）。
- * 诊断码与文案必须逐字可见——"不可选"三个字不构成解释。
- */
-const OBJECT_NODES = Array.from({ length: 8 }, (_, index) => {
-  const n = index + 1;
-  if (n === 3) {
-    return {
-      id: objectId(3),
-      kind: "nck_drive_object",
-      label: "驱动对象 3",
-      has_children: false,
-      selection_mode: 3,
-      diagnostics: [
-        {
-          code: "DEFINITION_SCOPE_NOT_COLLECTABLE",
-          message: "该驱动对象只服务身份探针（scope=identity），不得作为采集点位",
-          severity: 3,
-        },
-      ],
-    };
-  }
-  return {
-    id: objectId(n),
-    kind: "nck_drive_object",
-    label: `驱动对象 ${n}`,
-    has_children: false,
-    selection_mode: 2,
-    selection_payload_json: payloadOf({ channel: 1 }, [{ path: "channel", required: true }]),
-  };
-});
-
-function browseNodesOf(parent: string): Array<Record<string, unknown>> {
-  if (parent === "") return ROOT_NODES;
-  if (parent === AXES) return AXIS_NODES;
-  if (parent === CHANNELS) return CHANNEL_NODES;
-  if (parent === OBJECTS) return OBJECT_NODES;
-  return [];
-}
-
 // ---------------------------------------------------------------------------
-// 3. 请求桩：目录 / 预览 / 探测 / 任务快照 / 保存
+// 2. 请求桩：目录 / 预览 / 探测 / 任务快照 / 保存
 // ---------------------------------------------------------------------------
 
 /**
@@ -296,6 +337,8 @@ interface FlowState {
   previewLog: Array<Record<string, unknown>>;
   /** true ⇒ 探测返回 400 + 错误信封（失败用例）。 */
   browseFails: boolean;
+  /** true ⇒ 探测一律返回空页（"探测成功但没有对象"用例）。 */
+  browseEmpty: boolean;
 }
 
 function mkState(overrides: Partial<FlowState> = {}): FlowState {
@@ -306,6 +349,7 @@ function mkState(overrides: Partial<FlowState> = {}): FlowState {
     browseLog: [],
     previewLog: [],
     browseFails: false,
+    browseEmpty: false,
     ...overrides,
   };
 }
@@ -367,7 +411,7 @@ function installFetch(state: FlowState, probe: ReturnType<typeof createRequestPr
     if (url.endsWith("/descriptor")) {
       return ok({
         resources: [NATIVE_SCHEMA],
-        // 刻意不声明 browse：本文件验证的是「选择实际对象」探测，不是旧的资源浏览树。
+        // 刻意不声明 browse：本文件验证的是「联动选择」探测，不是旧的资源浏览树。
         resource_selection_methods: [],
       });
     }
@@ -394,7 +438,24 @@ function installFetch(state: FlowState, probe: ReturnType<typeof createRequestPr
           },
         });
       }
-      return ok({ nodes: browseNodesOf(body.parent ?? ""), next_cursor: null });
+      if (state.browseEmpty) {
+        return ok({ nodes: [], next_cursor: null });
+      }
+      const parent = body.parent ?? "";
+      // 响应体**逐字**来自驱动夹具：本文件不编造任何树 id 或节点形状。
+      if (!(parent in CONTRACT.pages)) {
+        // 与驱动真实行为一致：未知父节点是错误，不是空页（`UNKNOWN_PARENT`）。
+        return fail(400, {
+          error: { code: "UNKNOWN_PARENT", message: `未知的浏览父节点 \`${parent}\`` },
+        });
+      }
+      // 夹具只导出每个 parent 的**首页**（`next_cursor` 保留驱动的原值）。后续页在
+      // 真实设备上由驱动分页返回，这里如实给空页——绝不复读首页（那会让"分页到底"
+      // 变成死循环，掩盖真正的分页处理）。
+      if ((body.cursor ?? "") !== "") {
+        return ok({ nodes: [], next_cursor: null });
+      }
+      return ok(pageOf(parent));
     }
     if (url.startsWith("/api/v1/tasks?endpoint=")) {
       return ok({ tasks: state.tasks });
@@ -420,10 +481,13 @@ async function waitPaneReady() {
   await screen.findByTestId("add-point-entry", undefined, { timeout: 10_000 });
 }
 
-/** 打开添加抽屉并等树渲染（抽屉是 lazy 的：未打开时内部组件不挂载）。 */
+/** 打开添加抽屉，展开变量下拉并展开全部分组（抽屉是 lazy 的：未打开时内部组件不挂载）。 */
 async function openDrawer(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByTestId("add-point-entry"));
   await screen.findByTestId("catalog-tree");
+  await user.click(screen.getByTestId("nck-variable-picker-trigger"));
+  await screen.findByTestId("catalog-tree-panel");
+  expandAllCatalogGroups();
 }
 
 beforeEach(() => {
@@ -435,11 +499,11 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// 用例 1：树形选择 → 选实际对象 → 预览 → 添加 → 保存（顺序与载荷）
+// 用例 1：树形选择 → 级联选通道实例 → 自动填参 → 预览 → 添加 → 保存
 // ---------------------------------------------------------------------------
 
-describe("流程 1：展开树 → 选中变量 → 出现对象入口 → 探测 → 选对象 → 预览 → 添加", () => {
-  it("tree_select_probe_preview_add_then_save_keeps_request_order_and_payload", async () => {
+describe("流程 1：选中变量 → 出现级联下拉 → 展开才探测 → 选通道 → 自动填参 → 预览 → 添加", () => {
+  it("tree_select_cascade_probe_preview_add_then_save_keeps_request_order_and_payload", async () => {
     const user = userEvent.setup();
     const probe = createRequestProbe();
     const state = mkState();
@@ -451,54 +515,42 @@ describe("流程 1：展开树 → 选中变量 → 出现对象入口 → 探�
     expect(probe.count("GET:definitions")).toBe(1);
 
     await openDrawer(user);
-    // 未选变量：只有选择入口，**没有**"选择实际对象"（按需出现）。
-    expect(screen.queryByTestId("object-probe")).toBeNull();
+    // 未选变量：只有选择入口，**没有**级联下拉（按需出现）。
+    expect(screen.queryByTestId("nck-object-cascade")).toBeNull();
 
     // ---- 展开树：先折叠再展开（证明分组可开合，且条目在分组内）----
     expect(
-      screen.getByTestId("catalog-tree-group-cnc_variable").getAttribute("data-expanded"),
+      screen.getByTestId("catalog-tree-group-system_variable").getAttribute("data-expanded"),
     ).toBe("true");
-    await user.click(screen.getByTestId("catalog-tree-toggle-cnc_variable"));
+    await user.click(screen.getByTestId("catalog-tree-toggle-system_variable"));
     expect(
-      screen.getByTestId("catalog-tree-group-cnc_variable").getAttribute("data-expanded"),
+      screen.getByTestId("catalog-tree-group-system_variable").getAttribute("data-expanded"),
     ).toBe("false");
-    expect(screen.queryByTestId("catalog-tree-leaf-axis.position.actual_bcs")).toBeNull();
-    await user.click(screen.getByTestId("catalog-tree-toggle-cnc_variable"));
-    await screen.findByTestId("catalog-tree-leaf-axis.position.actual_bcs");
+    expect(screen.queryByTestId("catalog-tree-leaf-channel.feed.actual")).toBeNull();
+    await user.click(screen.getByTestId("catalog-tree-toggle-system_variable"));
+    await screen.findByTestId("catalog-tree-leaf-channel.feed.actual");
 
-    // ---- 选中变量：对象需求**来自定义数据**（targets/target_required）----
-    await user.click(screen.getByTestId("catalog-tree-leaf-axis.position.actual_bcs"));
-    expect((await screen.findByTestId("object-probe-needs")).textContent).toBe(
-      "需要选择：axis* / channel*",
-    );
+    // ---- 选中变量：需要的参数**来自定义数据**（targets/target_required）----
+    await user.click(screen.getByTestId("catalog-tree-leaf-channel.feed.actual"));
+    expect(await screen.findByTestId("nck-object-level-channel")).toBeTruthy();
+    // 语义页没有任何 Target/Arguments 手填框（参数只能来自驱动载荷）。
+    expect(screen.queryByTestId(/^nck-target-/)).toBeNull();
+    expect(screen.queryByTestId(/^nck-argument-/)).toBeNull();
     // 选变量本身不探测、不预览（避免每个变量都拉起驱动进程读真机）。
     expect(probe.count("BROWSE")).toBe(0);
     expect(probe.count("PREVIEW")).toBe(0);
 
-    // ---- 探测：点击才发请求；根页 parent 为空 ----
-    await user.click(screen.getByTestId("object-probe-open"));
-    const axesNode = await screen.findByTestId(`object-probe-node-${AXES}`);
-    // 分组节点声明 selection_mode=3：不可选，且原因可见。
-    expect(axesNode.getAttribute("data-mode")).toBe("not_selectable");
-    expect(within(axesNode).getByTestId("object-probe-diagnostic-IDENTITY_GROUP_CONTAINER")).toBeTruthy();
-    expect(within(axesNode).queryByTestId(`object-probe-use-${AXES}`)).toBeNull();
-
-    // ---- 下钻：请求体字段名必须是 `parent`（写错服务端会静默回到根）----
-    await user.click(screen.getByTestId(`object-probe-expand-${AXES}`));
-    await screen.findByTestId(`object-probe-node-${axisId(2)}`);
-
-    // ---- 选用实际对象：填参只取驱动载荷里的坐标 ----
-    await user.click(screen.getByTestId(`object-probe-use-${axisId(2)}`));
-    expect((screen.getByLabelText("target-axis") as HTMLInputElement).value).toBe("2");
-    expect((screen.getByLabelText("target-channel") as HTMLInputElement).value).toBe("1");
-    expect(screen.getByTestId("object-probe-applied").textContent).toContain("axis=2");
+    // ---- 展开下拉才探测；选通道2 ⇒ 参数由载荷自动填入 ----
+    await pickObject("channel", "通道2");
+    expect(screen.getByTestId("nck-object-selected-channel").getAttribute("data-value")).toBe("2");
     expect(screen.getByTestId("nck-fill-notice").textContent).toContain(
       "参数已按所选实际对象填入",
     );
+    expect(screen.getByTestId("nck-fill-notice").textContent).toContain("驱动返回的选择载荷");
 
     // ---- 服务端预览确认身份（前端不产生 point_key）----
     const key = await screen.findByTestId("nck-point-key");
-    expect(key.textContent).toBe("axis.position.actual_bcs@axis=i:2,channel=i:1");
+    expect(key.textContent).toBe("channel.feed.actual@channel=i:2");
     expect(screen.getByTestId("nck-add-point").hasAttribute("disabled")).toBe(false);
 
     // ---- 添加：只进草稿，零写请求 ----
@@ -508,18 +560,18 @@ describe("流程 1：展开树 → 选中变量 → 出现对象入口 → 探�
     expect(screen.getAllByTestId("nck-point-row")).toHaveLength(1);
     expect(probe.count("PUT:tasks")).toBe(0);
 
-    // ---- 请求顺序与载荷：/definitions → /browse(parent) → preview → put ----
-    expect(state.browseLog).toEqual([
-      { parent: "", filter: "", cursor: "", limit: 50 },
-      { parent: AXES, filter: "", cursor: "", limit: 50 },
-    ]);
+    // ---- 探测：广度优先遍历驱动的目录分支，逐条记录 parent ----
+    // channel 只有一级必填 key：channels 页拿到候选后 early-stop，不再扫 spindles/objects。
+    expect(firstVisits(state)).toEqual(SCAN_ORDER_CHANNEL);
+    expect(state.browseLog.every((entry) => entry.limit === 50)).toBe(true);
+    // 预览载荷逐字来自"选中对象的驱动载荷"：target 是自动来的，不是手填的。
     expect(state.previewLog[0]).toEqual({
       family: "828d",
       kind: "nck_variable",
       parameters: {
-        variable_id: "axis.position.actual_bcs",
+        variable_id: "channel.feed.actual",
         definition_revision: 1,
-        target: { axis: 2, channel: 1 },
+        target: { channel: 2 },
         arguments: {},
       },
     });
@@ -547,11 +599,11 @@ describe("流程 1：展开树 → 选中变量 → 出现对象入口 → 探�
     expect((sent[0]!.binding.config as { points: NckPointSelection[] }).points).toEqual([
       {
         kind: "nck_variable",
-        point_key: "axis.position.actual_bcs@axis=i:2,channel=i:1",
+        point_key: "channel.feed.actual@channel=i:2",
         parameters: {
-          variable_id: "axis.position.actual_bcs",
+          variable_id: "channel.feed.actual",
           definition_revision: 1,
-          target: { axis: 2, channel: 1 },
+          target: { channel: 2 },
           arguments: {},
         },
       },
@@ -560,11 +612,11 @@ describe("流程 1：展开树 → 选中变量 → 出现对象入口 → 探�
 });
 
 // ---------------------------------------------------------------------------
-// 用例 2：搜索跨分类命中 → 选中 → 同一流程走通
+// 用例 2：搜索跨分类命中 → 两级下拉（channel + spindle）→ 预览 → 添加
 // ---------------------------------------------------------------------------
 
-describe("流程 2：搜索跨分类命中后选中，仍走同一条流程", () => {
-  it("search_cross_category_keeps_grouping_and_completes_same_flow", async () => {
+describe("流程 2：搜索跨分类命中后选中，channel 与 spindle 各选一级（不再手填）", () => {
+  it("search_cross_category_then_two_cascade_levels_fill_both_keys", async () => {
     const user = userEvent.setup();
     const probe = createRequestProbe();
     const state = mkState();
@@ -573,13 +625,13 @@ describe("流程 2：搜索跨分类命中后选中，仍走同一条流程", ()
     await waitPaneReady();
     await openDrawer(user);
 
-    // 搜索词 "actual" 同时命中 cnc_variable 与 system_variable 两条不同分类的条目。
+    // 搜索词 "actual" 同时命中三个分类里的条目。
     fireEvent.change(screen.getByTestId("nck-variable-search"), {
       target: { value: "actual" },
     });
     await waitFor(() =>
       expect(screen.getByTestId("catalog-tree-search-summary").textContent).toContain(
-        "跨分类匹配 2 个变量（搜索不改变分类，只过滤条目）",
+        "跨分类匹配 3 个变量（搜索不改变分类，只过滤条目）",
       ),
     );
     // 命中项**仍在各自原分组里**（搜索只过滤条目，不重新归类）。
@@ -593,30 +645,109 @@ describe("流程 2：搜索跨分类命中后选中，仍走同一条流程", ()
         "catalog-tree-leaf-channel.feed.actual",
       ),
     ).toBeTruthy();
+    expect(
+      within(screen.getByTestId("catalog-tree-group-system_variable")).getByTestId(
+        "catalog-tree-leaf-spindle.speed.actual",
+      ),
+    ).toBeTruthy();
     // 没有命中的分组在搜索时隐藏（分组结构本身不重建）。
     expect(screen.queryByTestId("catalog-tree-group-drive_parameter")).toBeNull();
 
-    // 从"另一个分类"里选中，继续同一条流程。
-    await user.click(screen.getByTestId("catalog-tree-leaf-channel.feed.actual"));
-    expect((await screen.findByTestId("object-probe-needs")).textContent).toBe(
-      "需要选择：channel*",
-    );
+    // 从"另一个分类"里选中主轴变量：需求同时来自定义数据（channel + spindle）。
+    await user.click(screen.getByTestId("catalog-tree-leaf-spindle.speed.actual"));
+    expect(await screen.findByTestId("nck-object-level-channel")).toBeTruthy();
+    expect(screen.getByTestId("nck-object-level-spindle")).toBeTruthy();
+    // 缺一级 ⇒ 不可提交（fail-closed，不是"先加上再说"）。
+    expect(screen.getByTestId("nck-add-point").hasAttribute("disabled")).toBe(true);
 
-    await user.click(screen.getByTestId("object-probe-open"));
-    await screen.findByTestId(`object-probe-node-${CHANNELS}`);
-    await user.click(screen.getByTestId(`object-probe-expand-${CHANNELS}`));
-    await user.click(await screen.findByTestId(`object-probe-use-${channelId(2)}`));
-    expect((screen.getByLabelText("target-channel") as HTMLInputElement).value).toBe("2");
+    // ---- 第一级：通道（主轴1 由轴2/轴4 指向，但通道必须单独选）----
+    await pickObject("channel", "通道1");
+    expect(screen.getByTestId("nck-object-selected-channel").getAttribute("data-value")).toBe("1");
+    // 只填了一级 ⇒ 仍不可提交。
+    expect(screen.getByTestId("nck-add-point").hasAttribute("disabled")).toBe(true);
+
+    // ---- 第二级：主轴（只能来自驱动读数）----
+    const spindle1 = spindleNode(1);
+    expect(labelOf(spindle1)).toContain("轴2");
+    expect(labelOf(spindle1)).toContain("轴4");
+    await pickObject("spindle", "主轴1");
+    expect(screen.getByTestId("nck-object-selected-spindle").getAttribute("data-value")).toBe("1");
 
     const key = await screen.findByTestId("nck-point-key");
-    expect(key.textContent).toBe("channel.feed.actual@channel=i:2");
-    await user.click(screen.getByTestId("nck-add-point"));
+    expect(key.textContent).toBe("spindle.speed.actual@channel=i:1,spindle=i:1");
+    expect(screen.getByTestId("nck-add-point").hasAttribute("disabled")).toBe(false);
 
+    await user.click(screen.getByTestId("nck-add-point"));
     await waitFor(() =>
       expect(screen.getByTestId("draft-save-summary").textContent).toBe("1 项点位变更（新增 1）"),
     );
-    // 探测仍然只走两次（根 → 通道组），与树形入口完全同一条路径。
-    expect(state.browseLog.map((entry) => entry.parent)).toEqual(["", CHANNELS]);
+    // 两级都来自同一次探测（探测只发生一次，不因选第二级重复拉驱动）。
+    // channel+spindle 都找到后 early-stop，不再扫 objects。
+    expect(firstVisits(state)).toEqual(SCAN_ORDER_SPINDLE);
+    expect(probe.count("PUT:tasks")).toBe(0);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// 用例 2b：轴实际位置 → 轴实例 + 通道实例 → 自动填参 → 预览 → 添加
+// ---------------------------------------------------------------------------
+
+describe("流程 2b：轴实际位置必须能选到实际轴（axis 实例来自驱动读数）", () => {
+  it("axis_position_selects_actual_axis_and_channel", async () => {
+    const user = userEvent.setup();
+    const probe = createRequestProbe();
+    const state = mkState();
+    installFetch(state, probe);
+    renderPane();
+    await waitPaneReady();
+    await openDrawer(user);
+
+    await selectVariableViaTreeWith(user, "axis.position.actual_bcs");
+    // 定义声明 channel + axis 两级；先选通道，再选轴（复现用户实际操作顺序）。
+    expect(await screen.findByTestId("nck-object-level-channel")).toBeTruthy();
+    expect(screen.getByTestId("nck-object-level-axis")).toBeTruthy();
+    await pickObject("channel", "通道1");
+    expect(screen.getByTestId("nck-object-selected-channel").getAttribute("data-value")).toBe("1");
+    await openCascade("axis");
+    await waitFor(() => expect(cascadeOptions("axis").length).toBeGreaterThan(0));
+    // MB1（轴6）是 output_type=0 的未确认形态：仍作为真实轴出现，但标签如实标注。
+    const mb1 = cascadeOptions("axis").find((option) =>
+      String(option.textContent ?? "").includes("MB1"),
+    );
+    expect(mb1).toBeTruthy();
+    expect(String(mb1!.textContent)).toContain("未确认有效驱动输出");
+
+    // 轴候选来自驱动真实读数（夹具里 MX1 = 轴1），不是前端按 1..31 生成。
+    await pickObject("axis", "MX1");
+    expect(screen.getByTestId("nck-object-selected-axis").getAttribute("data-value")).toBe("1");
+
+    // 两个 key 都来自驱动载荷；服务端预览给出最终身份。
+    const key = await screen.findByTestId("nck-point-key");
+    expect(key.textContent).toBe("axis.position.actual_bcs@axis=i:1,channel=i:1");
+    expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(false);
+
+    await user.click(screen.getByTestId("nck-add-point"));
+    await waitFor(() =>
+      expect(screen.getByTestId("draft-save-summary").textContent).toBe("1 项点位变更（新增 1）"),
+    );
+
+    // 第二条 collect 轴定义也必须能走通：axis.position.commanded_mcs。
+    await openDrawer(user);
+    await selectVariableViaTreeWith(user, "axis.position.commanded_mcs");
+    await pickObject("channel", "通道1");
+    await openCascade("axis");
+    await waitFor(() => expect(cascadeOptions("axis").length).toBeGreaterThan(0));
+    await pickObject("axis", "MY1");
+    expect(screen.getByTestId("nck-object-selected-axis").getAttribute("data-value")).toBe("2");
+    const secondKey = await screen.findByTestId("nck-point-key");
+    expect(secondKey.textContent).toBe("axis.position.commanded_mcs@axis=i:2,channel=i:1");
+    await user.click(screen.getByTestId("nck-add-point"));
+    await waitFor(() =>
+      expect(screen.getByTestId("draft-save-summary").textContent).toBe("2 项点位变更（新增 2）"),
+    );
+
+    // axis+channel 都找到后 early-stop：channels 页之后不再扫 spindles/objects。
+    expect(firstVisits(state)).toEqual(SCAN_ORDER_AXIS);
     expect(probe.count("PUT:tasks")).toBe(0);
   }, 60_000);
 });
@@ -636,29 +767,28 @@ describe("流程 3：待分类条目可见、标注未知、不得被当作四�
     await openDrawer(user);
 
     // 驱动明确 unclassified：落"其他 / 待分类"，逐条标注未知。
-    const dead = screen.getByTestId("catalog-tree-leaf-dead.variable.probe");
+    const dead = screen.getByTestId("catalog-tree-leaf-channel.feed.override");
     expect(dead.getAttribute("data-category")).toBe("unclassified");
     expect(dead.getAttribute("data-category-known")).toBe("false");
-    expect(
-      screen.getByTestId("catalog-tree-leaf-badge-dead.variable.probe").textContent,
-    ).toBe("分类未知（驱动 unclassified）");
-    // 旧目录（category 缺失）同样落待分类，但只说"分类未知"（不冒充失败关闭结论）。
+    // 明确 unclassified 与"category 缺失"必须可区分（不合并成一个"未知"）。
+    expect(dead.getAttribute("data-explicitly-unclassified")).toBe("true");
+    // 旧目录（category 缺失）同样落待分类，但**不是**驱动明确的 unclassified。
     const legacy = screen.getByTestId("catalog-tree-leaf-mystery.variable");
     expect(legacy.getAttribute("data-category")).toBe("unclassified");
     expect(legacy.getAttribute("data-category-known")).toBe("false");
-    expect(
-      screen.getByTestId("catalog-tree-leaf-badge-mystery.variable").textContent,
-    ).toBe("分类未知");
+    expect(legacy.getAttribute("data-explicitly-unclassified")).toBe("false");
+    // 分组标题明确标注"分类未知"（列表行只留名称 + 可用状态，不再逐行挂长角标）。
+    expect(screen.getByTestId("catalog-tree-unclassified-hint").textContent).toContain("分类未知");
     // 分类依据如实写"导航规则"（不是手册事实）。
     expect(
       screen.getByTestId("catalog-tree-basis-unclassified").textContent,
     ).toBe("导航规则");
 
-    // 四类计数之和 = 4：两条待分类**不**被算进四类之一。
+    // 四类计数之和 = 全部条目 - 两条待分类（不写死数字，避免新增定义后失真）。
     const fourCounts = ["cnc_variable", "system_variable", "machine_data", "drive_parameter"].map(
       (code) => Number(screen.getByTestId(`catalog-tree-group-count-${code}`).textContent),
     );
-    expect(fourCounts.reduce((a, b) => a + b, 0)).toBe(4);
+    expect(fourCounts.reduce((a, b) => a + b, 0)).toBe(CATALOG.length - 2);
     expect(screen.getByTestId("catalog-tree-group-count-unclassified").textContent).toBe("2");
 
     // 选中驱动明确 unclassified 的条目：可见原因，但**不可提交**。
@@ -666,11 +796,11 @@ describe("流程 3：待分类条目可见、标注未知、不得被当作四�
     expect((await screen.findByTestId("nck-category-unknown")).textContent).toContain(
       "CATEGORY_UNCLASSIFIED",
     );
-    // 即使参数填全也不放行：服务端预览照样能算出 Key（预览不判分类），
-    // 但分类守卫与 scope 准入是两道独立判定，提交按钮保持禁用。
-    await user.type(screen.getByLabelText("target-channel"), "1");
+    // 即使参数由载荷填全、服务端预览照样能算出 Key（预览不判分类），
+    // 分类守卫与 scope 准入是两道独立判定，提交按钮保持禁用。
+    await pickObject("channel", "通道1");
     expect((await screen.findByTestId("nck-point-key")).textContent).toBe(
-      "dead.variable.probe@channel=i:1",
+      "channel.feed.override@channel=i:1",
     );
     expect(screen.getByTestId("nck-add-point").hasAttribute("disabled")).toBe(true);
     expect(probe.count("PUT:tasks")).toBe(0);
@@ -678,11 +808,11 @@ describe("流程 3：待分类条目可见、标注未知、不得被当作四�
 });
 
 // ---------------------------------------------------------------------------
-// 用例 4：selection_mode=3 的节点
+// 用例 4：驱动判为不可选的节点（码与文案都必须可见）
 // ---------------------------------------------------------------------------
 
-describe("流程 4：selection_mode=3 节点必须阻断并显示诊断 code+message", () => {
-  it("not_selectable_node_shows_diagnostic_code_and_message", async () => {
+describe("流程 4：驱动判为不可选的对象必须可见并带诊断 code+message", () => {
+  it("not_selectable_object_is_listed_disabled_with_its_diagnostic_code", async () => {
     const user = userEvent.setup();
     const probe = createRequestProbe();
     const state = mkState();
@@ -691,31 +821,27 @@ describe("流程 4：selection_mode=3 节点必须阻断并显示诊断 code+mes
     await waitPaneReady();
     await openDrawer(user);
 
-    await user.click(screen.getByTestId("catalog-tree-leaf-axis.position.actual_bcs"));
-    await screen.findByTestId("object-probe-needs");
-    await user.click(screen.getByTestId("object-probe-open"));
-    await user.click(await screen.findByTestId(`object-probe-expand-${OBJECTS}`));
-
-    const blocked = await screen.findByTestId(`object-probe-node-${objectId(3)}`);
-    expect(blocked.getAttribute("data-mode")).toBe("not_selectable");
-    // 诊断码 + 文案逐条展示（不是笼统的"不可选"）。
-    const diagnostic = within(blocked).getByTestId(
-      "object-probe-diagnostic-DEFINITION_SCOPE_NOT_COLLECTABLE",
+    await user.click(screen.getByTestId("catalog-tree-leaf-axis.ctrlout.module_number"));
+    await screen.findByTestId("nck-object-level-axis");
+    await openCascade("axis");
+    // 轴页现在会给出真实轴实例（8 个）；同时模板目录里的 ctrlout 叶仍作为
+    // **不可选候选**可见，码与文案逐字露出，不是笼统的"没有对象"。
+    await waitFor(() => expect(cascadeOptions("axis")).toHaveLength(8));
+    const select = screen.getByTestId("nck-object-select-axis") as HTMLSelectElement;
+    const blocked = Array.from(select.querySelectorAll("option")).filter(
+      (option) => option.disabled,
     );
-    expect(diagnostic.textContent).toContain("DEFINITION_SCOPE_NOT_COLLECTABLE");
-    expect(diagnostic.textContent).toContain("该驱动对象只服务身份探针（scope=identity）");
-    // severity=3 ⇒ 同时进入"可见阻断"，标题带码、正文带原因。
-    const block = within(blocked).getByTestId(
-      "object-probe-block-DEFINITION_SCOPE_NOT_COLLECTABLE",
-    );
-    expect(block.textContent).toContain("不可选用（DEFINITION_SCOPE_NOT_COLLECTABLE）");
-    expect(block.textContent).toContain("不得作为采集点位");
-    // 没有"用这个对象"入口，也不会产生任何填参结论。
-    expect(within(blocked).queryByTestId(`object-probe-use-${objectId(3)}`)).toBeNull();
-    expect(screen.queryByTestId("object-probe-applied")).toBeNull();
-    expect(screen.queryByTestId("object-probe-fill-error")).toBeNull();
-    // 同列表里其它候选对象照常可选（阻断是按节点，不是按列表）。
-    expect(screen.getByTestId(`object-probe-use-${objectId(4)}`)).toBeTruthy();
+    expect(blocked.length).toBeGreaterThan(0);
+    const text = blocked.map((option) => option.textContent ?? "").join(" | ");
+    expect(text).toContain("DEFINITION_SCOPE_NOT_COLLECTABLE");
+    expect(text).toContain("不可采集");
+    // 本用例的合成定义是 collect（让它出现在树上），只验证 blocked 候选可见；
+    // 真实目录里 axis.ctrlout.* 是 scope=identity，会在可采集过滤阶段就被排除。
+    expect(screen.queryByTestId("nck-fill-notice")).toBeNull();
+    expect(screen.queryByTestId("nck-point-key")).toBeNull();
+    expect(screen.getByTestId("nck-add-point").hasAttribute("disabled")).toBe(true);
+    // 有可选轴实例 ⇒ 缺参数提示是"请选择"而不是"设备没有/探测失败"。
+    expect(screen.queryByTestId("nck-cascade-missing")).toBeNull();
   }, 60_000);
 });
 
@@ -733,21 +859,25 @@ describe("流程 5：探测失败必须显示失败与原因，不显示空列�
     await waitPaneReady();
     await openDrawer(user);
 
-    await user.click(screen.getByTestId("catalog-tree-leaf-axis.position.actual_bcs"));
-    await user.click(await screen.findByTestId("object-probe-open"));
+    await user.click(screen.getByTestId("catalog-tree-leaf-channel.feed.actual"));
+    await openCascade("channel");
 
-    const error = await screen.findByTestId("object-probe-error");
+    const error = await screen.findByTestId("nck-cascade-error");
     expect(error.getAttribute("data-code")).toBe("PROBE_REQUEST_FAILED");
     // 稳定码 + 服务端错误码 + 原文一起露出（可排查，不是"没有对象"）。
     expect(error.textContent).toContain("PROBE_REQUEST_FAILED");
     expect(error.textContent).toContain("CONNECTION_LOST");
     expect(error.textContent).toContain("驱动进程已退出");
-    // 失败时**不渲染空态**，并额外给一条"不会用空列表冒充结果"的告警。
-    expect(screen.queryByTestId("object-probe-empty")).toBeNull();
-    expect(screen.getByTestId("object-probe-error-alert").textContent).toContain(
-      "不会用空列表冒充结果",
-    );
-    // 探测确实只发了一次（失败不自动重试成"多次探测"）。
+    expect(error.textContent).toContain("不会用空下拉冒充结果");
+    // 缺参数口径必须是"探测失败"，不得说成"设备没有"。
+    const missing = await screen.findByTestId("nck-cascade-missing");
+    expect(missing.getAttribute("data-reason")).toContain("probe_failed");
+    expect(missing.textContent).toContain("探测失败，不代表设备上没有该对象");
+    // 下拉本身也不是"静默空"：占位文案写明探测失败。
+    const select = screen.getByTestId("nck-object-select-channel") as HTMLSelectElement;
+    expect(select.querySelector("option")?.textContent).toContain("探测失败");
+    expect(cascadeOptions("channel")).toHaveLength(0);
+    // 探测确实只发了一次根请求（根就失败，不继续下钻、不自动重试）。
     expect(probe.count("BROWSE")).toBe(1);
   }, 60_000);
 });
@@ -756,8 +886,8 @@ describe("流程 5：探测失败必须显示失败与原因，不显示空列�
 // 用例 6：端点未连接 ⇒ 探测入口不可用且零请求
 // ---------------------------------------------------------------------------
 
-describe("流程 6：端点未连接时探测入口不可用且零请求", () => {
-  it("unconnected_endpoint_disables_probe_with_reason_and_sends_nothing", async () => {
+describe("流程 6：端点未连接时联动选择不可用且零请求", () => {
+  it("unconnected_endpoint_disables_cascade_with_reason_and_sends_nothing", async () => {
     const user = userEvent.setup();
     const probe = createRequestProbe();
     // 连接配置可读但没有 family ⇒ 端点不可用于在线探测。
@@ -768,29 +898,35 @@ describe("流程 6：端点未连接时探测入口不可用且零请求", () =>
     await openDrawer(user);
 
     await user.click(screen.getByTestId("catalog-tree-leaf-axis.position.actual_bcs"));
-    const gate = await screen.findByTestId("object-probe-gate");
+    const gate = await screen.findByTestId("nck-cascade-gate");
     expect(gate.textContent).toContain("需先创建并连接端点");
     expect(gate.textContent).toContain("连接配置不可读");
     expect(gate.textContent).toContain("不会发起在线探测");
 
-    // 入口禁用；即使被程序化点击也不发请求、不展开面板。
-    const openButton = screen.getByTestId("object-probe-open") as HTMLButtonElement;
-    expect(openButton.disabled).toBe(true);
-    fireEvent.click(openButton);
-    await waitFor(() => expect(openButton.disabled).toBe(true));
+    // 下拉禁用；即使被程序化聚焦也不发请求。
+    const select = screen.getByTestId("nck-object-select-axis") as HTMLSelectElement;
+    expect(select.disabled).toBe(true);
+    fireEvent.focus(select);
+    await waitFor(() => expect(select.disabled).toBe(true));
     expect(probe.count("BROWSE")).toBe(0);
-    expect(screen.queryByTestId("object-probe-panel")).toBeNull();
+    // 阻断 + 两条出路（先建端点 → 采集页；或切高级原生配置）。
+    const missing = screen.getByTestId("nck-cascade-missing");
+    expect(missing.getAttribute("data-reason")).toContain("probe_unavailable");
+    const guidance = screen.getByTestId("nck-cascade-guidance").textContent ?? "";
+    expect(guidance).toContain("先完成设备创建与连接");
+    expect(guidance).toContain("「采集」页配置点位");
+    expect(guidance).toContain("「高级原生配置」");
     // 端点 family 缺失本身另有独立告警（探测闸门不是唯一提示）。
     expect(screen.getByTestId("nck-endpoint-family-missing")).toBeTruthy();
   }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
-// 用例 7：未确认对象（真机轴 6 `MB1` 形态）
+// 用例 7：驱动"无法判定"的实例（只有诊断，不可展开、不可选）
 // ---------------------------------------------------------------------------
 
-describe("流程 7：未确认对象不可展开、不可选，也不伪造子节点", () => {
-  it("unconfirmed_node_is_not_expandable_not_selectable_and_sends_no_child_request", async () => {
+describe("流程 7：驱动无法判定的实例只显示诊断，不可选，也不伪造候选", () => {
+  it("undecidable_instance_is_diagnosed_not_selectable_and_not_offered", async () => {
     const user = userEvent.setup();
     const probe = createRequestProbe();
     const state = mkState();
@@ -799,30 +935,28 @@ describe("流程 7：未确认对象不可展开、不可选，也不伪造子�
     await waitPaneReady();
     await openDrawer(user);
 
-    await user.click(screen.getByTestId("catalog-tree-leaf-axis.position.actual_bcs"));
-    await user.click(await screen.findByTestId("object-probe-open"));
-    await user.click(await screen.findByTestId(`object-probe-expand-${AXES}`));
+    await user.click(screen.getByTestId("catalog-tree-leaf-channel.feed.actual"));
+    await openCascade("channel");
+    await waitFor(() => expect(cascadeOptions("channel")).toHaveLength(2));
 
-    const mb1 = await screen.findByTestId(`object-probe-node-${axisId(6)}`);
-    expect(mb1.textContent).toContain("未确认");
-    // has_children=false ⇒ 文案是"无子节点"，没有"进入"入口。
-    expect(within(mb1).getByTestId(`object-probe-nochildren-${axisId(6)}`)).toBeTruthy();
-    expect(within(mb1).queryByTestId(`object-probe-expand-${axisId(6)}`)).toBeNull();
-    // 没有驱动载荷 ⇒ 也没有"用这个对象"入口（不可被当作可选实例）。
-    expect(within(mb1).queryByTestId(`object-probe-use-${axisId(6)}`)).toBeNull();
-
-    // 点它既不下钻也不选用：探测请求仍然只有"根 + 轴列表"两次。
-    fireEvent.click(within(mb1).getByTestId(`object-probe-nochildren-${axisId(6)}`));
-    expect(state.browseLog.map((entry) => entry.parent)).toEqual(["", AXES]);
-    expect(screen.queryByTestId("object-probe-applied")).toBeNull();
-    // 同组其余 7 个轴照常可用（未确认只影响它自己）。
-    expect(screen.getByTestId(`object-probe-use-${axisId(1)}`)).toBeTruthy();
-    expect(screen.getByTestId(`object-probe-use-${axisId(7)}`)).toBeTruthy();
+    // 诊断码与文案原样可见（"无法判定"不是"不存在"，必须能区分）。
+    const diagnostic = await screen.findByTestId(
+      "nck-cascade-diagnostic-IDENTITY_PENDING_REVIEW",
+    );
+    expect(diagnostic.textContent).toContain("IDENTITY_PENDING_REVIEW");
+    expect(diagnostic.textContent).toContain("无法判定");
+    expect(diagnostic.textContent).toContain(labelOf(CHANNEL_PENDING));
+    // 它不在候选里（没有载荷 ⇒ 不能成为可选项，也不伪造实例号）。
+    const values = cascadeOptions("channel").map((option) => option.value);
+    expect(values).not.toContain(idOf(CHANNEL_PENDING));
+    // 同页其余通道照常可用（无法判定只影响它自己）。
+    expect(values).toContain(idOf(channelNode(1)));
+    expect(screen.queryByTestId("nck-fill-notice")).toBeNull();
   }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
-// 用例 8：高级原生参数默认隐藏
+// 用例 8：高级原生配置默认不可见（两个入口互斥）
 // ---------------------------------------------------------------------------
 
 describe("流程 8：高级原生参数（module/column/line…）默认不可见", () => {
@@ -835,16 +969,17 @@ describe("流程 8：高级原生参数（module/column/line…）默认不可�
     await waitPaneReady();
     await openDrawer(user);
 
-    // 第一层：编辑器默认停在"语义点位"页，原生页整体折叠（不改数据、只改默认视图）。
+    // 第一层：编辑器默认停在「联动选择」页，原生页整体折叠（不改数据、只改默认视图）。
     const mode = await screen.findByTestId("nck-editor-mode");
     expect(mode.getAttribute("data-native-collapsed")).toBe("true");
+    expect(mode.getAttribute("data-editor-mode")).toBe("semantic");
     expect(screen.queryByTestId("nck-native-fields")).toBeNull();
     expect(document.getElementById("native-field-module")).toBeNull();
     expect(document.getElementById("native-field-column")).toBeNull();
     expect(document.getElementById("native-field-line")).toBeNull();
     expect(screen.queryByTestId("nck-native-add-point")).toBeNull();
 
-    // 主动展开后才渲染原生 12 字段。
+    // 主动展开后才渲染原生 12 字段，且联动表单整体消失（任何时刻只有一套表单）。
     await user.click(screen.getByRole("button", { name: "高级原生配置" }));
     await waitFor(() => expect(document.getElementById("native-field-module")).not.toBeNull());
     expect(screen.getByTestId("nck-editor-mode").getAttribute("data-native-collapsed")).toBe(
@@ -852,6 +987,8 @@ describe("流程 8：高级原生参数（module/column/line…）默认不可�
     );
     expect(document.getElementById("native-field-column")).not.toBeNull();
     expect(document.getElementById("native-field-line")).not.toBeNull();
+    expect(screen.queryByTestId("nck-object-cascade")).toBeNull();
+    expect(screen.queryByTestId("catalog-tree")).toBeNull();
 
     // 第二层：`ui.advanced` 标记的字段仍收在"高级（N）"折叠区里。
     expect(document.getElementById("native-field-transport_size")).toBeNull();
@@ -860,8 +997,8 @@ describe("流程 8：高级原生参数（module/column/line…）默认不可�
       expect(document.getElementById("native-field-transport_size")).not.toBeNull(),
     );
 
-    // 回到语义页 ⇒ 原生参数再次整体消失（不是"隐藏某个标签"）。
-    await user.click(screen.getByRole("button", { name: "语义点位" }));
+    // 回到联动选择 ⇒ 原生参数再次整体消失（不是"隐藏某个标签"）。
+    await user.click(screen.getByRole("button", { name: "联动选择" }));
     await waitFor(() => expect(screen.queryByTestId("nck-native-fields")).toBeNull());
     expect(document.getElementById("native-field-module")).toBeNull();
     // 整个过程零写请求（只是视图切换）。
@@ -870,11 +1007,11 @@ describe("流程 8：高级原生参数（module/column/line…）默认不可�
 });
 
 // ---------------------------------------------------------------------------
-// 补充：入口按需出现（不声明 targets 的条目没有"选择实际对象"）
+// 补充：入口按需出现（不声明 targets 的条目没有级联下拉）
 // ---------------------------------------------------------------------------
 
-describe("补充流程：只有需要对象实例的变量才出现「选择实际对象」入口", () => {
-  it("entry_appears_only_when_definition_declares_object_needs", async () => {
+describe("补充流程：只有需要对象实例的变量才出现级联下拉", () => {
+  it("cascade_appears_only_when_definition_declares_object_needs", async () => {
     const user = userEvent.setup();
     const probe = createRequestProbe();
     const state = mkState();
@@ -883,16 +1020,87 @@ describe("补充流程：只有需要对象实例的变量才出现「选择实�
     await waitPaneReady();
     await openDrawer(user);
 
-    // 该条目没有 targets ⇒ 定义元数据不足（不可提交），也没有对象入口。
+    // 该条目没有 targets ⇒ 定义元数据不足（不可提交），也没有级联下拉。
     await user.click(screen.getByTestId("catalog-tree-leaf-machine_data.mode"));
     expect(await screen.findByTestId("nck-model-reject")).toBeTruthy();
-    expect(screen.queryByTestId("object-probe")).toBeNull();
+    expect(screen.queryByTestId("nck-object-cascade")).toBeNull();
     expect(probe.count("BROWSE")).toBe(0);
 
-    // 换成声明了 targets 的条目 ⇒ 入口才出现。
+    // 换成声明了 targets 的条目 ⇒ 下拉才出现（选择后下拉已收起，先重新打开）。
+    openVariablePicker();
     await user.click(screen.getByTestId("catalog-tree-leaf-axis.position.actual_bcs"));
-    expect(await screen.findByTestId("object-probe")).toBeTruthy();
-    // 但依然"不点击不探测"。
+    expect(await screen.findByTestId("nck-object-cascade")).toBeTruthy();
+    // 但依然"不展开不探测"。
     expect(probe.count("BROWSE")).toBe(0);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// 用例 9：通道树的三类结果在界面上必须可区分（有效 / 无法判定 / 不存在）
+// ---------------------------------------------------------------------------
+
+describe("流程 9：通道候选只显示驱动确认的通道，被拒实例不出现、无法判定有诊断", () => {
+  it("channel_candidates_show_only_confirmed_channels_and_mark_undecidable_ones", async () => {
+    const user = userEvent.setup();
+    const probe = createRequestProbe();
+    const state = mkState();
+    installFetch(state, probe);
+    renderPane();
+    await waitPaneReady();
+    await openDrawer(user);
+
+    await user.click(screen.getByTestId("catalog-tree-leaf-channel.feed.actual"));
+    await openCascade("channel");
+    await waitFor(() => expect(cascadeOptions("channel")).toHaveLength(2));
+
+    // 被设备拒绝的实例（夹具里通道 4 及以后）**一个节点都不该出现**——
+    // 否则界面会把"设备说没有"显示成"这里有个通道"。
+    expect(screen.queryByText(/^通道4/)).toBeNull();
+    // 有效通道：可选，标签写明读数依据。
+    expect(labelOf(channelNode(1))).toContain("位置1→机床轴1");
+    // 无法判定：诊断可见，且不在候选里。
+    const pending = screen.getByTestId("nck-cascade-diagnostic-IDENTITY_PENDING_REVIEW");
+    expect(pending.textContent).toContain("无法判定");
+    expect(cascadeOptions("channel").map((option) => option.value)).not.toContain(
+      idOf(CHANNEL_PENDING),
+    );
+
+    // 选用有效通道后填参来自驱动载荷（通道号不来自标签解析）。
+    await pickObject("channel", "通道1");
+    expect(screen.getByTestId("nck-object-selected-channel").getAttribute("data-value")).toBe("1");
+    expect((await screen.findByTestId("nck-point-key")).textContent).toBe(
+      "channel.feed.actual@channel=i:1",
+    );
+    expect(probe.count("PUT:tasks")).toBe(0);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// 用例 10：探测成功但设备没有对象 ⇒ "设备没有"口径 + 阻断（零写入）
+// ---------------------------------------------------------------------------
+
+describe("流程 10：探测成功但没有对象时必须说清「设备没有」并阻断", () => {
+  it("successful_but_empty_probe_blocks_with_no_candidates_wording", async () => {
+    const user = userEvent.setup();
+    const probe = createRequestProbe();
+    const state = mkState({ browseEmpty: true });
+    installFetch(state, probe);
+    renderPane();
+    await waitPaneReady();
+    await openDrawer(user);
+
+    await user.click(screen.getByTestId("catalog-tree-leaf-channel.feed.actual"));
+    await openCascade("channel");
+    const missing = await screen.findByTestId("nck-cascade-missing");
+    expect(missing.getAttribute("data-reason")).toContain("no_candidates");
+    expect(missing.textContent).toContain("探测成功，但设备没有返回");
+    expect(missing.textContent).not.toContain("探测失败");
+    // 没有对象 ⇒ 没有可用配置：无填参、无身份、按钮禁用（零写请求）。
+    expect(screen.queryByTestId("nck-fill-notice")).toBeNull();
+    expect(screen.queryByTestId("nck-point-key")).toBeNull();
+    expect(screen.getByTestId("nck-add-point").hasAttribute("disabled")).toBe(true);
+    expect(probe.count("PUT:tasks")).toBe(0);
+    // 根页就没有对象 ⇒ 没有可下钻的分支，探测只发一次（不空转）。
+    expect(probe.count("BROWSE")).toBe(1);
   }, 60_000);
 });

@@ -33,6 +33,32 @@ pub const CODE_IDENTITY_PREVIEW: &str = "IDENTITY_PREVIEW";
 /// **不阻断**选用，但必须显式提示（进语义表单补全后才可能预览成功）。
 pub const CODE_IDENTITY_UNRESOLVED: &str = "IDENTITY_UNRESOLVED";
 
+/// 浏览父节点未知（格式非法或不在本驱动给出的树里）。
+///
+/// 为什么必须是一个**错误码**而不是空页：Browse 的 `parent` 为空才是"根"。
+/// 若未知 id 也回落到空页/根节点，调用方把字段名写错（例如 `parent_node_id`）
+/// 或引用了一条本驱动不存在的树时，看到的都是"请求成功但对象是空的"——
+/// 与"设备上确实没有该对象"完全无法区分。宁可整次请求失败，也不伪造结论。
+pub const CODE_UNKNOWN_PARENT: &str = "UNKNOWN_PARENT";
+
+/// 实例读到了，但**无法判定**它是否存在（数据形状异常、语义不明）。
+///
+/// 与"不存在"的区别：不存在是设备明确拒绝（`S7_JOB_*`/`S7_ITEM_*`），
+/// 这里是"读通了但读到的值解释不出结论"，必须交人工复核，不得静默丢弃。
+pub const CODE_PENDING_REVIEW: &str = "IDENTITY_PENDING_REVIEW";
+
+/// 实例读取遇到通信/协议失败（非设备拒绝）：**读不到**，不等于不存在。
+///
+/// 典型来源：连接中断、响应 transport/长度不符、解码失败。这类失败会让
+/// 枚举中断，因此诊断文案必须同时说明"后续实例未枚举/集合可能不完整"。
+pub const CODE_INSTANCE_READ_FAILED: &str = "IDENTITY_INSTANCE_READ_FAILED";
+
+/// 主轴分配号非法或超范围（`SPIND_ASSIGN_TO_MACHAX` 返回 0 以外的越界值）。
+///
+/// 0 = 该轴不是主轴（正常）；越界值说明数据不可信，既不能当主轴也不能当
+/// "没有主轴"，只能给诊断。
+pub const CODE_SPINDLE_ASSIGN_INVALID: &str = "IDENTITY_SPINDLE_ASSIGN_INVALID";
+
 /// 准入拒绝 → wire 形态：码与文案都取自 [`CompileError`]。
 ///
 /// 载荷照旧随 `selection_payload_json` 给出：旧客户端按 1.7 的形态消费它，

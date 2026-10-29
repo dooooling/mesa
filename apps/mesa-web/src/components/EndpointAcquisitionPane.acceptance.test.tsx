@@ -14,6 +14,7 @@ import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import { buildAcquisition238, semanticPointKey, type AcquisitionFixture238 } from "../test/acquisitionFixture238";
 import { createRequestProbe, installProbedFetch } from "../test/requestProbe";
 import { selectVariableViaTreeWith } from "../test/catalogTreePick";
+import { pickObject, probeResponse } from "../test/objectCascadePick";
 import type { AcquisitionTaskShape, NckPointSelection } from "../deviceModel";
 
 const NCK_DRIVER = "sinumerik-nck";
@@ -126,6 +127,15 @@ function installFetch(state: MockState, probe: ReturnType<typeof createRequestPr
       state.putBodies.push(body.tasks);
       state.tasks = body.tasks;
       return ok({ ok: true });
+    }
+    if (method === "POST" && url === `/api/v1/endpoints/${EP}/browse`) {
+      // 联动选择的按需探测：逐级候选来自驱动契约夹具（夹具只导出首页，后续页为空）。
+      const browseBody = JSON.parse(String(init?.body ?? "{}")) as {
+        parent?: string;
+        cursor?: string;
+      };
+      if ((browseBody.cursor ?? "") !== "") return ok({ nodes: [], next_cursor: null });
+      return probeResponse(browseBody.parent ?? "");
     }
     if (method === "POST" && url === `/api/v1/endpoints/${EP}/stop`) {
       state.stopCalls += 1;
@@ -273,12 +283,15 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
     const scroller = screen.getByTestId("point-list-scroll");
     scroller.scrollTop = 240;
     await user.click(within(rowWith("轴实际位置")).getByTestId("point-row-edit"));
-    const input = await screen.findByLabelText("target-channel");
-    await user.clear(input);
-    await user.type(input, "3");
+    // 编辑态：已选对象以「已选」标签呈现（没有可键入的输入框）；重新选择另一台
+    // 实际对象后，通道号由驱动载荷自动改写（axis 一级保持不变）。
+    expect(screen.getByTestId("nck-object-selected-channel").getAttribute("data-value")).toBe("1");
+    expect(screen.getByTestId("nck-object-selected-axis").getAttribute("data-value")).toBe("1");
+    fireEvent.click(screen.getByTestId("nck-object-reselect-channel"));
+    await pickObject("channel", "通道2");
     await waitFor(() =>
       expect(screen.getByTestId("nck-point-key").textContent).toBe(
-        semanticPointKey("axis.position.actual_bcs", { axis: 1, channel: 3 }),
+        semanticPointKey("axis.position.actual_bcs", { axis: 1, channel: 2 }),
       ),
     );
     // 抽屉内的提交文案是「加入待保存列表 / 确认修改」，不是「保存点位」。
@@ -312,11 +325,11 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
     expect(sentPoints.slice(0, 235)).toEqual(state.fixture.points.slice(0, 235));
     expect(sentPoints[sentPoints.length - 3]).toEqual({
       kind: "nck_variable",
-      point_key: semanticPointKey("axis.position.actual_bcs", { axis: 1, channel: 3 }),
+      point_key: semanticPointKey("axis.position.actual_bcs", { axis: 1, channel: 2 }),
       parameters: {
         variable_id: "axis.position.actual_bcs",
         definition_revision: 1,
-        target: { axis: 1, channel: 3 },
+        target: { axis: 1, channel: 2 },
         arguments: {},
       },
     });
@@ -354,7 +367,8 @@ describe("添加：抽屉 → 选中资源 → 填写 → 加入待保存列表 
       "确认后加入页面草稿，保存配置后生效。",
     );
     await selectVariableViaTreeWith(user, "channel.feed.actual");
-    await user.type(screen.getByLabelText("target-channel"), "9");
+    // 参数由驱动载荷自动填入（通道 1 已被现有点位占用 ⇒ 选通道 2 形成新身份）。
+    await pickObject("channel", "通道2");
     await screen.findByTestId("nck-point-key");
     expect(screen.getByTestId("nck-add-point").textContent).toContain("加入待保存列表");
     await user.click(screen.getByTestId("nck-add-point"));
@@ -459,11 +473,13 @@ describe("错误恢复：加载 /endpoints 失败 ⇒ 状态未知但草稿仍�
     );
     await user.click(screen.getByTestId("add-point-entry"));
     await selectVariableViaTreeWith(user, "channel.program.status");
-    const target = screen.getByLabelText("target-channel");
-    await user.type(target, "2");
-    // 草稿仍可编辑：输入被接受（抽屉不被禁用）。
-    expect((target as HTMLInputElement).value).toBe("2");
-    // 但身份核验需要的 family 读不到 ⇒ 展示可处理原因（fail-closed，不是静默失败）。
+    // 草稿仍可编辑：联动下拉照常渲染（不再是手填框），但端点连接配置读不到 ⇒
+    // 探测闸门关闭、原因可见（fail-closed，不是静默失败）。
+    expect(screen.getByTestId("nck-object-cascade")).toBeTruthy();
+    const select = screen.getByTestId("nck-object-select-channel") as HTMLSelectElement;
+    expect(select.disabled).toBe(true);
+    expect(screen.getByTestId("nck-cascade-gate").textContent).toContain("需先创建并连接端点");
+    // 身份核验需要的 family 读不到 ⇒ 展示可处理原因。
     expect(await screen.findByTestId("nck-family-reject")).toBeTruthy();
 
     // 保存禁用（含只写配置），并且零写请求。
@@ -484,9 +500,9 @@ describe("验收 8：保存失败保留修改（草稿计数、保存区、行�
 
     await gotoPage(10);
     await user.click(within(rowWith("轴实际位置")).getByTestId("point-row-edit"));
-    const input = await screen.findByLabelText("target-channel");
-    await user.clear(input);
-    await user.type(input, "3");
+    // 编辑：重新选择通道（参数由驱动载荷改写），形成一次真实的「修改」变更。
+    fireEvent.click(screen.getByTestId("nck-object-reselect-channel"));
+    await pickObject("channel", "通道2");
     await waitFor(() => expect(screen.getByTestId("nck-point-key")).toBeTruthy());
     await user.click(screen.getByTestId("nck-add-point"));
     expect(screen.getByTestId("draft-save-summary").textContent).toBe("1 项点位变更（修改 1）");

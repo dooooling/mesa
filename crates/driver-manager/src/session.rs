@@ -992,11 +992,18 @@ impl Session {
                 if let Some(result) = resp.result
                     && !result.ok
                 {
+                    // 驱动侧的浏览失败必须**保留结构化码**（`SessionError::Driver`
+                    // 的既有约定：按 code 精确路由，禁止拼成字符串再回猜）。
+                    // 旧实现把它压成 `Handshake("kind/code: message")`，于是调用方
+                    // 只能看到一个笼统的 `BROWSE_FAILED`——驱动给出的稳定码
+                    // （例如 `UNKNOWN_PARENT`）在 REST 层彻底消失，用户看到的是
+                    // "驱动不可用"，而不是"你把父节点 id 写错了"。
                     let d = result.error.unwrap_or_default();
-                    return Err(SessionError::Handshake(format!(
-                        "{}/{}: {}",
-                        d.kind, d.code, d.message
-                    )));
+                    return Err(SessionError::Driver {
+                        kind: d.kind,
+                        code: d.code,
+                        message: d.message,
+                    });
                 }
                 let next = if resp.next_cursor.is_empty() {
                     None

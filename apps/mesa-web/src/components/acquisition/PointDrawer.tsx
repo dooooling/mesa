@@ -55,7 +55,8 @@ export function PointDrawer({
       keyboard={!busy}
       destroyOnClose
       data-testid={testId}
-      styles={{ body: { paddingTop: 8 }, footer: { padding: 12 } }}
+      // 抽屉内容一律不产生横向滚动：长变量名/原因必须换行，而不是把右侧推出视口。
+      styles={{ body: { paddingTop: 8, overflowX: "hidden", minWidth: 0 }, footer: { padding: 12 } }}
       footer={footer ? <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>{footer}</div> : null}
     >
       {noticeText ? (

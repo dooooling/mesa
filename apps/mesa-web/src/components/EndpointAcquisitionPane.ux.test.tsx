@@ -11,6 +11,7 @@ import userEvent from "@testing-library/user-event";
 import { message } from "antd";
 import { EndpointAcquisitionPane, type NckDefinitionMap } from "./EndpointAcquisitionPane";
 import { NCK_POINTS_KIND, type AcquisitionTaskShape, type NckPointSelection } from "../deviceModel";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-nck";
@@ -25,6 +26,7 @@ const DEFINITIONS: NckDefinitionMap = {
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
   },
 };
 

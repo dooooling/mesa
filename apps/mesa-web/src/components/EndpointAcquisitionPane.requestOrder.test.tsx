@@ -20,6 +20,7 @@ import {
   type NckPointSelection,
 } from "../deviceModel";
 import type { ResourceDescriptor } from "../types";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-order";
@@ -33,6 +34,7 @@ const DEFINITIONS: NckDefinitionMap = {
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
   },
 };
 

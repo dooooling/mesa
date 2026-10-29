@@ -477,6 +477,70 @@ fn prefill_from_native(
     (target, arguments)
 }
 
+/// 实例坐标载荷：**单一实例坐标**（通道 / 主轴）的浏览节点载荷。
+///
+/// 与 [`semantic_payload`] 的区别（为什么不能复用）：那里必须绑定**一条**具体
+/// 定义的 `variable_id` + `definition_revision`，而实例节点服务的是**多条**
+/// 定义（42 条定义里 16 条的 `targets` 含 `channel`、3 条含 `spindle`）。
+/// 绑死其中任何一条，前端 `deriveObjectFill` 的变量一致性判定就会把其余变量的
+/// 合法坐标判成 `OBJECT_VARIABLE_MISMATCH`——用户明明选的是正确通道，却被
+/// 告知"这是另一个变量的对象"。
+///
+/// 因此载荷只给「坐标 + 身份键」，而这两样**取自真实定义**（不手写拼接）：
+/// - **适用定义** = 所有"声明该 Target 变体、且把它列为**必填身份键**"的定义
+///   （`channel` 16 条、`spindle` 3 条）；一条都没有 ⇒ 该坐标不是任何定义的身份
+///   组成部分，返回 `None`（由调用方转成诊断，绝不猜）；
+/// - **身份键** = 本节点**提供**的那一个坐标（`[{path: kind, required: true}]`）。
+///   为什么不是某条定义的完整键集：主轴定义同时需要 `channel`，节点只负责给出
+///   `spindle`；把 `channel` 也写进载荷等于替用户编一个通道号。缺的键由前端
+///   `deriveObjectFill` 如实列为"仍需手动填写"，不是靠节点补默认值；
+/// - **身份模板** = 适用定义中身份键最少（并列取 `variable_id` 最小）的那条的
+///   `identity_template` 原文，仅用于说明"这条坐标怎么用"；
+/// - **`applies_to_variables`** = 该载荷对哪些定义有效，让"载荷与需要该坐标的
+///   定义匹配"成为**可机械核对**的事实而非口头约定。
+///
+/// 返回 `None` 的两种情况都必须由调用方转成诊断（不可选 + 稳定码）：
+/// 内嵌目录不可用、该变体没有任何"把它当必填身份键"的定义。
+pub fn instance_coordinate_payload(family: &str, kind: TargetKind, number: u32) -> Option<String> {
+    let catalog = embedded_catalog()?;
+    let path = kind.as_str();
+    // 目录 `by_id` 是 BTreeMap，`for_family` 的输出顺序稳定（variable_id 升序）。
+    let defs: Vec<&VariableDefinition> = catalog
+        .for_family(family)
+        .into_iter()
+        .filter(|d| d.targets.contains(&kind))
+        .filter(|d| d.identity_keys.iter().any(|k| k.path == path && k.required))
+        .collect();
+    if defs.is_empty() {
+        return None;
+    }
+
+    // 代表定义：身份键最少（并列取 variable_id 最小，`defs` 已按 id 升序）。
+    let template_def = defs.iter().min_by_key(|d| d.identity_keys.len()).copied()?;
+
+    let mut target = Map::new();
+    target.insert(path.to_string(), Value::from(number));
+    let applies: Vec<&str> = defs.iter().map(|d| d.variable_id.as_str()).collect();
+    Some(
+        serde_json::json!({
+            "kind": POINT_KIND_VARIABLE,
+            "parameters": {
+                "target": Value::Object(target),
+                "arguments": Value::Object(Map::new()),
+            },
+            "identity": {
+                "keys": [{ "path": path, "required": true }],
+                "template": template_def.identity_template,
+                // 单坐标不构成完整身份（多键定义还缺别的键），因此**不**给预览 Key：
+                // 猜一个"看起来完整"的 Key 正是本轮要消除的东西。
+                "preview_point_key": Value::Null,
+                "applies_to_variables": applies,
+            },
+        })
+        .to_string(),
+    )
+}
+
 /// 目录节点（模板入口）。
 ///
 /// IPC 1.8 起显式声明 `NOT_SELECTABLE`：分支节点永远不该被选用，由驱动把这件事
