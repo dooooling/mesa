@@ -211,6 +211,17 @@ impl GoldenRef {
     }
 }
 
+/// 正式定义分类（方案 B）：用于目录导航，不代表可采集性或地址已验证。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionCategory {
+    CncVariable,
+    SystemVariable,
+    MachineData,
+    DriveParameter,
+    Unclassified,
+}
+
 /// 单条变量定义（**NCK Driver 侧类型**，Core 不可见）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -223,6 +234,9 @@ pub struct VariableDefinition {
     pub family: String,
     pub scope: DefinitionScope,
     pub semantics_status: SemanticsStatus,
+    /// 正式导航分类。缺省仅允许旧 revision 兼容；新 revision 必须提供。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<DefinitionCategory>,
     pub label: LocalizedText,
     pub source: Vec<DefinitionSource>,
     /// 适用 Target 类型（**合法字段组合由此声明**，不在代码里硬编码）。
