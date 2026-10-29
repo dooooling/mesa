@@ -99,11 +99,17 @@ fn raw_latest_definitions() -> BTreeMap<String, Value> {
         "drivers/sinumerik-nck/definitions/828d/r2.json",
     ))
     .expect("r2.json 必须是合法 JSON");
-    doc["definitions"].as_array().expect("r2.json 必须含 definitions 数组")
-        .iter().map(|d| (
-            d["variable_id"].as_str().expect("variable_id").to_string(),
-            d.clone(),
-        )).collect()
+    doc["definitions"]
+        .as_array()
+        .expect("r2.json 必须含 definitions 数组")
+        .iter()
+        .map(|d| {
+            (
+                d["variable_id"].as_str().expect("variable_id").to_string(),
+                d.clone(),
+            )
+        })
+        .collect()
 }
 
 async fn catalog_json(query: Value) -> Value {
@@ -364,8 +370,14 @@ async fn definitions_payload_is_verbatim_projection() {
         ] {
             assert_eq!(row[field], src[field], "{id} 的 `{field}` 必须逐字投影");
         }
-        assert_eq!(row["category"], src["category"], "{id} 的 category 必须来自 revision 2 定义");
-        assert_eq!(row["category_basis"], "definition", "{id} 的 category_basis 必须标记为 definition");
+        assert_eq!(
+            row["category"], src["category"],
+            "{id} 的 category 必须来自 revision 2 定义"
+        );
+        assert_eq!(
+            row["category_basis"], "definition",
+            "{id} 的 category_basis 必须标记为 definition"
+        );
     }
 }
 
@@ -380,15 +392,24 @@ async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_availab
     assert_eq!(row["category"], "machine_data");
     assert_eq!(row["category_basis"], "definition");
     assert_eq!(row["semantics_status"], "candidate");
-    assert_eq!(row["source"].as_array().unwrap().iter().any(|s| {
-        s["kind"] == "measurement" && s["reference"] == "docs/evidence/nck-live-identity-probe.txt"
-    }), false);
+    assert_eq!(
+        row["source"].as_array().unwrap().iter().any(|s| {
+            s["kind"] == "measurement"
+                && s["reference"] == "docs/evidence/nck-live-identity-probe.txt"
+        }),
+        false
+    );
 
     let historical = catalog_json(json!({
         "variable_id": "axis.encoder.module_number",
         "revision": 1
-    })).await;
-    let old = historical["definitions"].as_array().unwrap().first().unwrap();
+    }))
+    .await;
+    let old = historical["definitions"]
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap();
     assert_eq!(old["revision"], 1);
     assert_eq!(old["category_basis"], "navigation_rule");
     assert_eq!(old["semantics_status"], "verified");
