@@ -17,6 +17,17 @@
 //! - 文件末尾 `layout_derived_vector_is_absent_from_device_evidence` 把上述两条
 //!   边界变成可执行断言，防止后续有人把推导值“升级”成证据。
 //!
+//! NOTE(真机证据已出现，边界改写而非放宽): 后续的一次性真机只读验证产出了
+//! `docs/evidence/nck-live-chan-assignment-probe.txt`（`device-observed`），
+//! 它记录了**同一个请求字节**在实体 828D 上的真实响应，结论是
+//! “`module=26` 下返回的载荷与手册 `TYPE_UWORD` 不符 ⇒ 结果待核实”，
+//! 即：它**没有**把本文件的推导值抬升成“已确认可读”，反而给出了否定证据。
+//! 因此守卫改为：除该文件外，证据目录里任何文件仍不得提到 `chanAssignment`
+//! 或本文件的字节串；而对该文件加**正面断言**——必须逐字记录设备返回字节、
+//! 必须标注 `device-observed`、必须保留“待核实/UNDETERMINED”的结论，
+//! 且不得出现任何具体的方式组分配结果（`assigned(<数字>`）。
+//! 这样既保留了原意（推导不得冒充证据），也不会因为真机证据存在而失效。
+//!
 //! ## 为什么是 `column=21` 而不是 `column=10010`
 //!
 //! 手册 `docs/reference/manuals/828D_ncvar_lists_man_0325_en-US.pdf` p1065 的
@@ -389,6 +400,11 @@ const EVIDENCE_JSON: &str = concat!(
 const EVIDENCE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/evidence");
 /// 已观测 block 表源码（真机证据集合；本文件不得往里加推导值）。
 const BLOCK_GOLDEN_SRC: &str = include_str!("block_wire_golden.rs");
+/// 唯一允许提到 `chanAssignment` 的证据文件：一次性真机只读验证的逐字记录。
+///
+/// 它记录的是**设备真实返回**（`device-observed`），不是推导值；其结论为
+/// “载荷与手册 `TYPE_UWORD` 不符 ⇒ 待核实”，因此不构成“推导值被抬升成证据”。
+const DEVICE_OBSERVED_FILE: &str = "nck-live-chan-assignment-probe.txt";
 
 /// 把空白去掉的小写十六进制形态，便于跨排版比对（`12 08 82 …` ≡ `120882…`）。
 fn squash(s: &str) -> String {
@@ -398,12 +414,14 @@ fn squash(s: &str) -> String {
         .collect()
 }
 
-/// 布局推导向量**不得**出现在任何真机证据里（本文件的核心边界断言）。
+/// 布局推导向量**不得**冒充真机证据（本文件的核心边界断言）。
 ///
-/// 三条独立检查：
+/// 四条独立检查：
 /// 1. `block_wire_golden.rs` 的已观测 block 表里不得出现本文件的期望字节；
 /// 2. 证据矩阵 `block_observations` 里不得出现 N 区（`area_unit` = 0x01）观测；
-/// 3. `docs/evidence/` 下任何文件都不得提到 `chanAssignment` 或本文件的字节串。
+/// 3. `docs/evidence/` 下除 `DEVICE_OBSERVED_FILE` 外的任何文件都不得提到
+///    `chanAssignment` 或本文件的字节串；
+/// 4. `DEVICE_OBSERVED_FILE` 本身必须是"如实、不抬升"的记录（见下方断言）。
 ///
 /// 这是「正向断言已知状态」的守卫写法（同 `block_wire_golden.rs` 的
 /// `unobserved_blocks_must_not_get_golden_bytes`）：一旦有人把推导值写进证据，
@@ -449,7 +467,7 @@ fn layout_derived_vector_is_absent_from_device_evidence() {
         );
     }
 
-    // 3) 证据目录里没有任何文件把 chanAssignment 当已观测事实记录。
+    // 3) 除真机验证记录外，证据目录里没有任何文件把 chanAssignment 当已观测事实记录。
     let mut checked = 0usize;
     for entry in std::fs::read_dir(EVIDENCE_DIR)
         .unwrap_or_else(|e| panic!("读不到证据目录 {EVIDENCE_DIR}: {e}"))
@@ -465,9 +483,13 @@ fn layout_derived_vector_is_absent_from_device_evidence() {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        // 该文件由第 4 段单独校验（它记录的是设备返回，不是本文件的推导值）。
+        if name == DEVICE_OBSERVED_FILE {
+            continue;
+        }
         assert!(
             !text.contains("chanassignment"),
-            "证据文件 {name} 提到 chanAssignment：本轮只有布局推导，没有真机证据，\
+            "证据文件 {name} 提到 chanAssignment：除 {DEVICE_OBSERVED_FILE} 外没有真机证据，\
              不得把它写成设备观测"
         );
         assert!(
@@ -480,4 +502,38 @@ fn layout_derived_vector_is_absent_from_device_evidence() {
         checked >= 5,
         "证据目录应至少检查到 5 个文件，实际 {checked}"
     );
+
+    // 4) 唯一的真机验证记录：允许提到 chanAssignment，但必须"如实、不抬升"。
+    //
+    // 这些断言的方向与原禁令一致——真机证据可以记录**设备返回了什么**，
+    // 但不得把它写成"分配关系已确认"（那需要独立的配置对照证据，本轮没有）。
+    let path = std::path::Path::new(EVIDENCE_DIR).join(DEVICE_OBSERVED_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("真机证据文件 {DEVICE_OBSERVED_FILE} 读不到: {e}"));
+    let text = squash(&raw);
+    assert!(
+        text.contains("device-observed"),
+        "{DEVICE_OBSERVED_FILE} 必须标注 device-observed（真机实测），不得与推导值混淆"
+    );
+    assert!(
+        text.contains(&target),
+        "{DEVICE_OBSERVED_FILE} 必须逐字记录 chanAssignment 的请求字节 {target}"
+    );
+    // 设备实际返回 64 字节全 0（见证据文件 §5.2）：必须逐字留存，不能只写"读到了"。
+    assert!(
+        text.contains(&"00".repeat(64)),
+        "{DEVICE_OBSERVED_FILE} 必须逐字记录设备返回的 64 字节全 0 载荷"
+    );
+    assert!(
+        text.contains("undetermined"),
+        "{DEVICE_OBSERVED_FILE} 必须保留 UNDETERMINED（结果待核实）的判定"
+    );
+    // 反向断言：不得出现任何具体的方式组分配结果（`ASSIGNED(1)` 之类）。
+    // 本轮没有读出过任何一个 >0 的值，写出来就是编造。
+    for d in 0..=9u8 {
+        assert!(
+            !text.contains(&format!("assigned({d}")),
+            "{DEVICE_OBSERVED_FILE} 出现了具体分配结果 assigned({d}…)：本轮没有任何 >0 的读数，属编造"
+        );
+    }
 }

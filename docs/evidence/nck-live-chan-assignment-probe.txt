@@ -1,0 +1,460 @@
+# NCK 真机只读验证：`maxnumChannels` / `chanAssignment`（一次性脚手架）
+
+- 证据文件：`docs/evidence/nck-live-chan-assignment-probe.txt`（本轮**新建**）
+- 脚手架：`drivers/sinumerik-nck/tests/live_chan_assignment_probe.rs`（`#[ignore]`，一次性验证用，**不是**生产探针）
+- 运行时间（UTC）：2026-10-29T08:54:45Z 起（本机本地时间 UTC+08:00 = 2026-10-29 16:54）
+- 目标：`192.168.15.60:102`，`family=828d`，`local_tsap=1024`、`remote_tsap=3332`、
+  `pdu_length=480`（协商结果实测 **480**）、`max_read_items=1`、`timeout_ms=2000`
+- 隔离说明：**直连机床**（TCP/102 → COTP → S7 Setup → ReadVar），**不经 mesad、不连任何数据库、不改任何配置**；
+  只发 NC 变量**读**请求，未写参数、未发控制命令、未启动采集任务。
+- 分支/基线：`feat/definition-meta-object-trees` @ `4c7d26f`
+
+## 0. 结论先行（本轮到底证明了什么）
+
+| 项 | 结论 |
+|---|---|
+| 连接链路 | **正常**：协商 PDU=480，`AXIS_NAME` 基准 8/8 通过（MX1/MY1/MZ1/MSP1/MA1/MB1/MC1/MQ1，与既有证据逐字一致） |
+| 设备软件版本 | **`unknown`**：`nckVersion`（手册 p1073，N 区 `column=32`）按本轮的 `module` 假设读不出可用值（见 §4.4），**不推测** |
+| 设备型号 | **`unknown`**：`nckType`（手册 p1072，N 区 `column=31`）同样未取得可用值；`family=828d` 来自既有连接配置，**不当作本轮读数** |
+| `maxnumChannels` | **未验证**：设备 `ret=0xFF` 有返回，但返回的是 **8 字节 DOUBLE（0.002）**，与手册 `TYPE_UWORD` 不符 ⇒ 判定"结果待核实"，**不得**当作通道数使用 |
+| `chanAssignment` | **未验证**：设备 `ret=0xFF` 有返回，但返回 **64 字节全 0**，与手册 `TYPE_UWORD`（单通道 2 字节）不符 ⇒ 判定"结果待核实"，**不生成任何节点** |
+| 四类结果 | 本轮**只观察到 `UNDETERMINED`（待核实）**；`ASSIGNED` / `NOT_EXIST` / `READ_FAILED` 三类**均未实测** |
+| `mode_group.op_mode` | **与本轮无关，不宣称可读**（那是 `module=127` 的另一地址）；`mode_groups` 树**仍不可用** |
+
+**本轮最重要的新事实（device-observed）**：手册 p1065/p1069 的 `chanAssignment (N, Y)`、`maxnumChannels (N, Y)`
+属 **block Y（System data）**，而 `AXIS_NAME` 等既有可用探针用的是 **block M（Machine data）= module 26**。
+用 `module=26` 去打 block Y 的列号，设备**不报错**（`ret=0xFF`），而是返回**类型/长度完全对不上**的载荷——
+这正是 `docs/evidence/nck-native-address-evidence.json` 里 `unresolved: module-value-authority`
+（"什么权威规格把 NCK block 标识映射到 module 字节"）尚未解决的直接体现：
+**`module=26` 对 block Y 不成立，本轮无法用现有信息确定 block Y 的 module 字节，且按任务约束不做盲扫。**
+
+## 1. 证据等级标记约定（本文件全程遵守）
+
+| 标记 | 含义 | 本文件中的例子 |
+|---|---|---|
+| `manual` | 手册原文（`828D_ncvar_lists_man_0325_en-US.pdf`，p1065/p1069/p1071/p1072/p1073） | `chanAssignment` 的 `Column index: 21`、`TYPE_UWORD` |
+| `device-observed` | 本机实测的**请求字节 / 响应字节 / 返回码**，逐字记录、可复跑 | `12 08 82 01 00 15 00 01 1a 01` → `ret=0xFF`、64 字节全 0 |
+| `layout-derived` | 由 Mesa 编码布局推导（**非**抓包），仅用于说明"我们发出的是什么" | 10 字节 VarSpec 各字段位置、`area_unit = area<<5|unit` |
+| `inferred` | 由实测数据反推、但**没有**权威规格支撑（**不得**当结论用） | "module 字节 = block 标识"（由 M/S/SEGA/SSP… 的既有观测归纳） |
+
+## 2. 请求字节逐字节说明（`layout-derived`）
+
+10 字节 VarSpec：`0x12 0x08 <syntax> <area_unit> <column:u16BE> <line:u16BE> <module:u8> <line_count:u8>`
+（布局来源：Wireshark `packet-s7comm.c` 的 `s7comm_decode_param_item` / `s7comm_syntaxid_nck`，对应 `src/codec.rs`）。
+
+以 `chanAssignment`（N 区，area_no=1，column=21，line=1，module=26，count=1）为例：
+
+| 字节 | 值 | 来源 |
+|---|---|---|
+| `[0]` | `0x12` | 规范类型（协议常量） |
+| `[1]` | `0x08` | 规范体长 8（协议常量） |
+| `[2]` | `0x82` | syntax = current 单位 |
+| `[3]` | `0x01` | `area N(0)<<5 \| area_no 1` |
+| `[4..6]` | `00 15` | `manual`：column 21 |
+| `[6..8]` | `00 01` | `manual`：line = 通道号 1 |
+| `[8]` | `1a` | **假设值** module=26（沿用 `AXIS_NAME`；`manual` **不提供**该字节） |
+| `[9]` | `01` | count=1 |
+
+⇒ 整包 `12 08 82 01 00 15 00 01 1a 01`。其中 `[8]=0x1a` 是本轮**唯一没有手册依据**的字节，
+而本轮实测恰恰说明**它很可能就是错的**（见 §5）。
+
+## 3. 第一阶段：设备环境 + `AXIS_NAME` 基准（`device-observed`）
+
+- 连接：`已连接（生产链路 NckClient），协商 pdu=480`；原始字节链路另建一条会话，同样协商 **PDU=480**。
+- `AXIS_NAME`（N 区 `column=10000`，module 26，`UTF8_FIXED_16`，transport `0x09`）**8/8 通过**：
+
+| 轴 | 请求字节 | 响应字节（16B） | 解码 |
+|---|---|---|---|
+| 1 | `12 08 82 01 27 10 00 01 1a 01` | `4d 58 31 00 …`（后 13 字节 0） | `MX1` |
+| 2 | `12 08 82 01 27 10 00 02 1a 01` | `4d 59 31 00 …` | `MY1` |
+| 3 | `12 08 82 01 27 10 00 03 1a 01` | `4d 5a 31 00 …` | `MZ1` |
+| 4 | `12 08 82 01 27 10 00 04 1a 01` | `4d 53 50 31 …` | `MSP1` |
+| 5 | `12 08 82 01 27 10 00 05 1a 01` | `4d 41 31 00 …` | `MA1` |
+| 6 | `12 08 82 01 27 10 00 06 1a 01` | `4d 42 31 00 …` | `MB1` |
+| 7 | `12 08 82 01 27 10 00 07 1a 01` | `4d 43 31 00 …` | `MC1` |
+| 8 | `12 08 82 01 27 10 00 08 1a 01` | `4d 51 31 00 …` | `MQ1` |
+
+与 `docs/evidence/nck-live-identity-probe.txt:8-15` **逐字一致** ⇒ 链路与既有证据链可比，后续失败
+**不能**归因于"链路坏"。
+
+## 4. `maxnumChannels`（手册 p1069：`(N, Y)`、`$AN_DIM_CHANNELS`、`Column index: 4`、`TYPE_UWORD`）
+
+### 4.1 请求（`layout-derived`）
+
+`12 08 82 01 00 04 00 01 1a 01`（N/1，column=4，line=1，module=**26 假设**，count=1）
+
+### 4.2 生产链路（声明 `U16_LE` / 期望 2 字节）
+
+```
+[2026-10-29T08:54:45.674Z] maxnumChannels m26 [沿用假设]  req=12 08 82 01 00 04 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.677Z] maxnumChannels m127 [备选（逐个尝试，非盲扫）] req=12 08 82 01 00 04 00 01 7f 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：…)
+```
+
+⇒ `ret=0xFF`（设备接受）且 `transport=0x09`（与期望一致），**唯一不符的是数据长度**：
+说明"声明 2 字节 UWORD"与设备实际返回长度不一致，生产链路按 P1-4 fail-closed 丢弃数据
+（**正面结论**：生产路径不会把这种数据误标 GOOD）。
+
+### 4.3 原始字节链路（`S7Session::read_var`，不丢弃字节）
+
+```
+[2026-10-29T08:54:45.748Z] maxnumChannels col=4 line=1 m26  req=12 08 82 01 00 04 00 01 1a 01 | ret=0xFF | transport=0x09 | len=8 | data=fc a9 f1 d2 4d 62 60 3f
+```
+
+| 事实 | 值 |
+|---|---|
+| 响应数据长度 | **8 字节**（手册 `TYPE_UWORD` = 2 字节） |
+| 原始字节 | `fc a9 f1 d2 4d 62 60 3f` |
+| 按 f64(LE) 解 | **0.002** |
+| 按 2×u32(LE) 解 | `0xD2F1A9FC` = 3539053052、`0x3F60624D` = 1063281229 |
+| 按 u16(LE) 解（手册类型） | `0xA9FC` = 43516（高位另有 6 字节无处安放 ⇒ 长度不符） |
+
+### 4.4 合理性判断
+
+- 手册语义：`maxnumChannels` 是"系统理论上可能的通道数维度"，是**小整数**（个位/十位级），`TYPE_UWORD`。
+- 实测：**8 字节 DOUBLE = 0.002**，既不匹配类型也不匹配语义。
+- ⇒ **判定：结果待核实（`UNDETERMINED`），不得解释为通道数**。不生成节点、不写入任何定义。
+- 进一步：`nckType`（col=31）返回 `7b 14 ae 47 e1 7a 94 3f` = f64 **0.02**（同样 8 字节）；
+  `nckVersion`（col=32）返回 `02 00 00 00` = u32 **2**（4 字节）；`numBAGs`（col=3）返回 `01 00 00 00` = u32 **1**（4 字节）。
+  四个同属 block Y 的标量返回**四种不同长度/类型**，与手册"都是 `TYPE_UWORD`/`TYPE_DOUBLE` 定长标量"的语义**互相矛盾**
+  ⇒ 一致地指向"读到的不是这些变量"。
+
+## 5. `chanAssignment`（手册 p1065：`(N, Y)`、`MD10010: ASSIGN_CHAN_TO_MODE_GROUP[x]`、`Column index: 21`、`Line index: Channel number`、`Max. line index: maxnumChannels`、`TYPE_UWORD`）
+
+### 5.1 扫描上界如何定（**没有盲扫**）
+
+`maxnumChannels` 未取得（§4）⇒ 手册给的上界未知。任务约束是"最多 `maxnumChannels` 个索引且不超过 31"，
+**在不知道 `maxnumChannels` 的情况下扫 31 个索引就是越界盲扫**，因此本轮只做 **line=1 定点观测**，
+并在第 1 轮 + 第 2 轮各做一次（两轮一致性）。
+
+上界的独立旁证（§6）：本机 `C/2..C/8` 的 `progStatus` 全部被设备拒绝（`ret=0x0A`），只有 `C/1` 可读
+⇒ 本机**只有 1 个活动通道**，索引 2 以上没有独立的"该通道存在"证据支撑，更不该盲扫。
+
+### 5.2 逐索引结果表（`device-observed`）
+
+| line | 轮次 | 请求字节 | 响应字节 | 长度 | 解码值 | 判定 |
+|---|---|---|---|---|---|---|
+| 1 | R1 | `12 08 82 01 00 15 00 01 1a 01` | `00`×64（全 0） | 64 | 无法按 `TYPE_UWORD` 解出 | **UNDETERMINED（结果待核实）** |
+| 1 | R2 | `12 08 82 01 00 15 00 01 1a 01` | `00`×64（全 0） | 64 | 同上 | **UNDETERMINED（结果待核实）** |
+
+生产链路预检（声明 `U16_LE`，期望 2 字节）：
+
+```
+[2026-10-29T08:54:45.680Z] chanAssignment line=1 预检  req=12 08 82 01 00 15 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：…)
+```
+
+### 5.3 为什么"64 字节全 0"不能解释成"通道不存在"
+
+- 若把 64 字节按 32×`UWORD` 解释，就是"32 个通道全都不存在"；
+- 但 `C/1` 的 `progStatus` **可读**（`U32(5)`，见 §6），通道 1 **客观存在**；
+- ⇒ 该解释**自相矛盾，被证伪**。64 字节全 0 更像是"打错了 block 后读到的空缓冲区"。
+- 判定因此只能是 `UNDETERMINED`，**不能**记为 `NOT_EXIST`，更不能生成"通道不存在"的节点。
+
+### 5.4 两轮一致性
+
+两轮请求字节、响应字节、长度、判定**完全一致**（见 §7 原始输出）。
+一致性只能说明"该地址在该设备上是稳定可重复的"，**不能**说明"读到的就是 `chanAssignment`"。
+
+## 6. 配置对照（独立可确认的通道配置）
+
+`C/<n>/S/progStatus`（C 区 `column=13`、`module=127`；module 字节来自既有真机观测
+`docs/evidence/nck-live-samples-probe.txt:8`）：
+
+| 通道 | 请求字节 | 响应 | 结论 |
+|---|---|---|---|
+| C/1 | `12 08 82 41 00 0d 00 01 7f 01` | `ret=0xFF`、`05 00`（`U32(5)`） | **存在且可读** |
+| C/2 | `12 08 82 42 00 0d 00 01 7f 01` | `ret=0x0A`、无数据 | 设备拒绝 |
+| C/3 | `12 08 82 43 00 0d 00 01 7f 01` | `ret=0x0A` | 设备拒绝 |
+| C/4 | `12 08 82 44 00 0d 00 01 7f 01` | `ret=0x0A` | 设备拒绝 |
+| C/5 | `12 08 82 45 00 0d 00 01 7f 01` | `ret=0x0A` | 设备拒绝 |
+| C/6 | `12 08 82 46 00 0d 00 01 7f 01` | `ret=0x0A` | 设备拒绝 |
+| C/7 | `12 08 82 47 00 0d 00 01 7f 01` | `ret=0x0A` | 设备拒绝 |
+| C/8 | `12 08 82 48 00 0d 00 01 7f 01` | `ret=0x0A` | 设备拒绝 |
+
+**对照结论**：本机**只有 1 个活动通道**（独立于 `chanAssignment` 的证据）。
+由于 `chanAssignment` 本身未能读出可用值，**无法**做"通道 1 被分配到方式组 n"的逐项比对
+⇒ 配置对照**只完成了一半**（通道存在性有独立证据；通道↔方式组分配关系无独立证据）。
+
+## 7. 四类结果是否真的区分开
+
+| 类别 | 本轮是否实测 | 索引 |
+|---|---|---|
+| `ASSIGNED(n)`（返回 >0） | **未实测** | — |
+| `NOT_EXIST`（返回 0） | **未实测** | — |
+| `READ_FAILED`（拒绝/超时/通信失败） | **未实测**（`chanAssignment` 上无一次拒绝或超时） | — |
+| `UNDETERMINED`（待核实） | **已实测** | line=1（两轮） |
+
+⇒ 四类在**代码里**是严格分开的（`Verdict` 枚举 + `verdict_of` 单点判定），但**在本机数据上只落到一类**。
+"无效通道返回 0"这条**未实测**，因此**不得**声称五项验证全部完成。
+
+## 8. 验收项：哪些通过、哪些无法证明
+
+| 验收项 | 结果 | 依据 |
+|---|---|---|
+| 直连只读、不经 mesad / 数据库 | **通过** | 全程仅 `NckClient`/`S7Session` 读请求，未写参数、未发控制 |
+| `AXIS_NAME` 基准 8/8 | **通过** | §3，与既有证据逐字一致 |
+| 请求/响应字节完整留存 | **通过** | §4.3、§5.2、§7 原始输出 |
+| `maxnumChannels` 读数为合理值 | **无法证明**（结果待核实） | §4.4 |
+| `chanAssignment` 逐索引枚举 | **无法证明**（上界未知 + 载荷不可解） | §5.1–5.3 |
+| "返回 0 = 通道不存在"实测 | **未实测** | §7 |
+| "返回 >0 = 分配到方式组 n"实测 | **未实测** | §7 |
+| "设备拒绝 ≠ 通道不存在"实测 | **未实测**（本地址上没出现拒绝） | §7 |
+| 两轮一致性 | **通过**（一致，但只证明可重复性） | §5.4 |
+| 通道配置独立对照 | **部分通过**（只有存在性） | §6 |
+| 设备软件版本 | **`unknown`** | §4.4 |
+| 设备型号 | **`unknown`** | §4.4 |
+
+## 9. `module` 字节：本轮的直接结论（对 `unresolved: module-value-authority` 的影响）
+
+- 既有可用观测给出的 block→module 对应（`inferred`，由真机字节归纳，**非**规格）：
+  `M=26`（A/N/V 区机床数据）、`RP=21`、`SEGA=112`、`SSP=114`、`SGA=115`、`SPARPP=122`、`SPARP=125`、`S=127`。
+  可交叉印证的两条：`drivers/sinumerik-nck/presets/828d.json` 里
+  `828d.N.M.MDSA_AXCONF_MACHAX_NAME_TAB` = N 区 block **M** / module **26**（本轮 8/8 读通），
+  `828d.B.S.opMode` = B 区 block **S** / module **127**（与 C 区 block S 同为 127）
+  ⇒ 至少 `M`、`S` 两个 block 的 module 字节在**跨区一致**，支持"module 字节 = block 标识"这一 `inferred` 结论。
+- 手册 p1065/p1069 明确把 `chanAssignment` / `maxnumChannels` 归入 **block `Y`（System data）**：
+  条目名写作 `chanAssignment (N, Y)` / `maxnumChannels (N, Y)`，而手册 p18–p19 的 "Data blocks"
+  表里 `Y  System data` 只在 **A / N** 两区打勾；p20–p22 的 §4.3 又把寻址要素明确列为
+  "Area 与 area number / **Block** / 列号 / 行号"（示例 `Block SEMA`、`Block TO`、`Block Y`）。
+  ⇒ "(N, Y)" = 区 N + block Y，**而 `Y` 的 module 字节没有任何手册或规格来源**。
+- 本轮实测：用 `module=26`（= block M）读 block Y 的列号，设备**接受请求但不返回该变量的数据**
+  （长度/类型全部对不上）。⇒ **`module=26` 对 block Y 不成立**。
+- 按任务约束（"不盲扫 module 追求成功"），本轮**不**枚举其它 module 值。
+  block Y 的 module 字节仍是**未解决项**，且现在有了一个明确的否定证据：**26 不是它**。
+
+## 10. 本轮请求计数（可复核的"有界"证据）
+
+| 阶段 | 请求数（每请求 1 项） |
+|---|---|
+| 阶段 1（生产链路）：`nckType` 1 + `nckVersion` 1 + `AXIS_NAME` 8 + `maxnumChannels` 2 + `chanAssignment` 预检 1 + `progStatus` 8 | 21 |
+| 阶段 2（原始字节链路）：`nckType` 1 + `nckVersion` 1 + `maxnumChannels` 1 + `numBAGs` 1 + `chanAssignment` 2（两轮） | 6 |
+| **合计（本轮定稿脚手架）** | **27** |
+
+另有一次**脚手架早期版本**的试运行（尚未加入原始字节链路，见附录 B）：22 次请求，
+其中 `chanAssignment` 只打了 line=1 一次。两次合计 **49** 次读请求，全部为只读、全部在手册索引范围内
+（`chanAssignment` 只用了 line=1）。
+
+## 11. 复核命令（只读，可原样复跑）
+
+```text
+# 1) 重跑脚手架（会连真机，需显式 --ignored）
+cargo test -p mesa-driver-sinumerik-nck --test live_chan_assignment_probe -- --ignored --nocapture
+
+# 2) 三个 blob 未改动（本文件撰写时的实测值）
+git hash-object drivers/sinumerik-nck/definitions/828d/r1.json          # 3c0abe67cbcb64b525cddec1584e6e1747e0f062
+git hash-object drivers/sinumerik-nck/definitions/828d/DIGESTS.lock     # d724be75d161cf49d6346971b8f4a6125867fb77
+git hash-object drivers/sinumerik-nck/definitions/828d/r1.meta.json     # 084e60f5811f5cc54632b1a2b28fc3fe896a0a25
+
+# 3) 手册原文定位（本地缓存的 03/2025 NC 变量手册文本）
+#    p1065 chanAssignment / p1069 maxnumChannels / p1071 numBAGs / p1072 nckType / p1073 nckVersion
+Select-String -Path docs/reference/.cache_manual_nc-variables-032025.txt -Pattern "chanAssignment chanAssignment|maxnumChannels maxnumChannels|nckType nckType|nckVersion nckVersion|numBAGs numBAGs"
+```
+
+## 12. 待确认（open）
+
+1. **block Y 的 module 字节**（`unresolved: module-value-authority`，本轮新增否定证据：≠26）。需要规格来源或官方说明，**不得**靠枚举猜。
+2. **设备软件版本 / 型号**：`nckType`/`nckVersion` 同属 block Y，未读出；需要先用正确的 module 字节才能取得。
+3. `maxnumChannels` / `chanAssignment` 的真实载荷长度与类型（同样依赖 1）。
+4. `chanAssignment` 在"通道不存在"时到底返回 `0` 还是被拒（手册说返回 `0`，**本轮未实测**）。
+5. 本机是否真的只有 1 个通道（`progStatus` 证据支持，但 `maxnumChannels` 未读到，理论上限仍未知）。
+
+---
+
+# 附录 A：完整逐字运行输出（定稿脚手架，`device-observed`）
+
+命令：
+`cargo test -p mesa-driver-sinumerik-nck --test live_chan_assignment_probe -- --ignored --nocapture`
+
+```text
+   Compiling mesa-driver-sinumerik-nck v0.5.0 (D:\Mine\Project\mesa\drivers\sinumerik-nck)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.23s
+     Running tests\live_chan_assignment_probe.rs (target\debug\deps\live_chan_assignment_probe-8322a96f4f5cc5bd.exe)
+
+running 1 test
+=== 阶段 0：会话建立（只读，直连机床，不经 mesad）===
+[2026-10-29T08:54:45.602Z] 目标 192.168.15.60:102 family=828d local_tsap=1024 remote_tsap=3332 请求 pdu=480 max_read_items=1 timeout_ms=2000
+[2026-10-29T08:54:45.627Z] 已连接（生产链路 NckClient），协商 pdu=480（只读）
+
+=== 阶段 1A：设备型号/软件版本（N 区，module 沿用假设 26）===
+[2026-10-29T08:54:45.630Z] nckType col=31 line=1 m26          req=12 08 82 01 00 1f 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.635Z] nckVersion col=32 line=1 m26       req=12 08 82 01 00 20 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+
+=== 阶段 1B：AXIS_NAME 基准（N 区 col=10000，生产探针常量）===
+[2026-10-29T08:54:45.640Z] AXIS_NAME line=1                   req=12 08 82 01 27 10 00 01 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 58 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MX1")
+[2026-10-29T08:54:45.644Z] AXIS_NAME line=2                   req=12 08 82 01 27 10 00 02 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 59 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MY1")
+[2026-10-29T08:54:45.651Z] AXIS_NAME line=3                   req=12 08 82 01 27 10 00 03 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 5a 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MZ1")
+[2026-10-29T08:54:45.656Z] AXIS_NAME line=4                   req=12 08 82 01 27 10 00 04 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 53 50 31 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MSP1")
+[2026-10-29T08:54:45.658Z] AXIS_NAME line=5                   req=12 08 82 01 27 10 00 05 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 41 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MA1")
+[2026-10-29T08:54:45.662Z] AXIS_NAME line=6                   req=12 08 82 01 27 10 00 06 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 42 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MB1")
+[2026-10-29T08:54:45.665Z] AXIS_NAME line=7                   req=12 08 82 01 27 10 00 07 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 43 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MC1")
+[2026-10-29T08:54:45.670Z] AXIS_NAME line=8                   req=12 08 82 01 27 10 00 08 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 51 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MQ1")
+    → AXIS_NAME 基准 8/8 通过；轴名=1:MX1, 2:MY1, 3:MZ1, 4:MSP1, 5:MA1, 6:MB1, 7:MC1, 8:MQ1
+
+=== 阶段 1C：maxnumChannels（N col=4 line=1，声明 TYPE_UWORD）===
+[2026-10-29T08:54:45.674Z] maxnumChannels m26 [沿用假设]          req=12 08 82 01 00 04 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.677Z] maxnumChannels m127 [备选（逐个尝试，非盲扫）] req=12 08 82 01 00 04 00 01 7f 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+
+=== 阶段 1D：chanAssignment line=1 预检（N col=21）===
+[2026-10-29T08:54:45.680Z] chanAssignment line=1 预检           req=12 08 82 01 00 15 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+
+=== 阶段 1E：通道存在性对照（C/<n>/S/progStatus col=13 m127）===
+[2026-10-29T08:54:45.684Z] C/1 progStatus                     req=12 08 82 41 00 0d 00 01 7f 01 | ret=0xFF | transport=0x09 | len=2 | data=05 00 | decode=OK U32(5)
+[2026-10-29T08:54:45.687Z] C/2 progStatus                     req=12 08 82 42 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.693Z] C/3 progStatus                     req=12 08 82 43 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.695Z] C/4 progStatus                     req=12 08 82 44 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.698Z] C/5 progStatus                     req=12 08 82 45 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.701Z] C/6 progStatus                     req=12 08 82 46 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.705Z] C/7 progStatus                     req=12 08 82 47 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+[2026-10-29T08:54:45.707Z] C/8 progStatus                     req=12 08 82 48 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(P1-4：设备拒绝，或 transport/长度与声明不符，data 被丢弃)
+
+=== 阶段 2：原始字节复核（S7Session::read_var，不丢弃字节）===
+[2026-10-29T08:54:45.734Z] 已连接（原始字节链路），协商 pdu=480（只读）
+[2026-10-29T08:54:45.739Z] nckType col=31 line=1 m26          req=12 08 82 01 00 1f 00 01 1a 01 | ret=0xFF | transport=0x09 | len=8 | data=7b 14 ae 47 e1 7a 94 3f
+    → nckType 载荷 8 字节，uword 解出=Err("8 字节载荷，TYPE_UWORD 无法据此解出")（手册 p1072：16000 = 828D）
+[2026-10-29T08:54:45.745Z] nckVersion col=32 line=1 m26       req=12 08 82 01 00 20 00 01 1a 01 | ret=0xFF | transport=0x09 | len=4 | data=02 00 00 00
+    → nckVersion 载荷 4 字节，f32(LE)=0.000000000000000000000000000000000000000000003（与手册 TYPE_DOUBLE 不符，结果待核实）
+[2026-10-29T08:54:45.748Z] maxnumChannels col=4 line=1 m26    req=12 08 82 01 00 04 00 01 1a 01 | ret=0xFF | transport=0x09 | len=8 | data=fc a9 f1 d2 4d 62 60 3f
+    → maxnumChannels 未能解出（载荷/返回码见上）：**不盲扫**，本轮只做 line=1 定点观测
+[2026-10-29T08:54:45.751Z] numBAGs col=3 line=1 m26           req=12 08 82 01 00 03 00 01 1a 01 | ret=0xFF | transport=0x09 | len=4 | data=01 00 00 00
+    → numBAGs=Some(1)（读不到则不猜上界，判定标注待核实）
+
+=== 阶段 2A：chanAssignment（N col=21，line=1..=1，module=26）===
+--- 第 1 轮 ---
+[2026-10-29T08:54:45.755Z] chanAssignment R1 line=1           req=12 08 82 01 00 15 00 01 1a 01 | ret=0xFF | transport=0x09 | len=64 | data=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | verdict=UNDETERMINED(64 字节载荷，TYPE_UWORD 无法据此解出)
+--- 第 2 轮 ---
+[2026-10-29T08:54:45.759Z] chanAssignment R2 line=1           req=12 08 82 01 00 15 00 01 1a 01 | ret=0xFF | transport=0x09 | len=64 | data=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | verdict=UNDETERMINED(64 字节载荷，TYPE_UWORD 无法据此解出)
+
+--- 两轮一致性 ---
+    line=1   第1轮=UNDETERMINED(64 字节载荷，TYPE_UWORD 无法据此解出) 第2轮=UNDETERMINED(64 字节载荷，TYPE_UWORD 无法据此解出) 一致
+    → 两轮完全一致
+
+--- chanAssignment（第 1 轮）与 progStatus 可读性对照 ---
+    line=1   chanAssignment=UNDETERMINED(64 字节载荷，TYPE_UWORD 无法据此解出) progStatus=可读 U32(5)          不一致/不可判定
+
+=== 汇总：四类判定分布（第 1 轮）===
+    ASSIGNED    : —
+    NOT_EXIST   : —
+    READ_FAILED : —
+    UNDETERMINED: 1
+    !! 本次没有观察到 "返回 0 = 通道不存在" 的索引：该分类**未实测**，不得声称五项验证全部完成
+
+<<< 验证结束（只读：未写参数、未发控制、未启动采集任务）
+test live_chan_assignment_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+```
+
+说明（附录 A）：
+- 时间戳为 UTC（`Z`），本机本地时间为 UTC+08:00。
+- `ret=0xFF` = 设备逐项接受；`transport=0x09` = 设备返回的传输类型；
+  `len=<none> | data=<none>` 表示生产链路（`NckClient::read_vars`）按 P1-4 丢弃了数据（不是设备没回数据，
+  对照附录 A 里"阶段 2"的同一请求即可看到真实字节）。
+- 阶段 1E 的 `ret=0x0A` 是 S7 逐项返回码"对象不存在"（本仓库 `drivers/sinumerik-nck/src/fixture.rs:313`
+  也把"未记录的地址"默认成 `(0x0A, transport=0, 空载荷)`），不是超时、不是通信失败。
+  这是**协议语义**层面的解释，不是本轮独立证明的结论；本轮独立观察到的事实只是
+  "C/1 可读、C/2..C/8 返回 0x0A 且无数据"。
+- 阶段 2 里 `nckVersion` 那行打印的 `f32(LE)=…e-45` 是脚手架的兜底分支（4 字节按 f32 试解），
+  **没有工程意义**；该载荷的正确解读见 §4.4：按 `u32(LE)` = **2**。此处保留原始输出不改，
+  以免与逐字证据不符。
+
+---
+
+# 附录 B：脚手架早期版本的试运行（`device-observed`，不含原始字节链路）
+
+这一版**没有**原始字节链路（`S7Session::read_var`），只能看到生产链路被 P1-4 丢弃后的 `ret`/`transport`，
+因此无法解释"长度不符"的具体载荷。它的价值是：**独立复现**了"这些 N 区小列号地址在 module=26 下
+全部因长度不符被丢弃"这一事实，并且 `chanAssignment` 在该次运行里也只打了 line=1。
+
+命令：
+`cargo test -p mesa-driver-sinumerik-nck --test live_chan_assignment_probe -- --ignored --nocapture`
+
+```text
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running tests\live_chan_assignment_probe.rs (target\debug\deps\live_chan_assignment_probe-8322a96f4f5cc5bd.exe)
+
+running 1 test
+=== 会话建立（只读，直连机床，不经 mesad）===
+[2026-10-29T08:53:33.980Z] 目标 192.168.15.60:102 family=828d local_tsap=1024 remote_tsap=3332 请求 pdu=480 max_read_items=1 timeout_ms=2000
+[2026-10-29T08:53:34.009Z] 已连接，协商 pdu=480（只读）
+
+=== 第一步 A：设备型号/软件版本（N 区，module 沿用假设 26）===
+[2026-10-29T08:53:34.014Z] nckType col=31 line=1 m26          req=12 08 82 01 00 1f 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝)
+    → nckType 未取得可解码值（见上行的 ret/transport/job_error）
+[2026-10-29T08:53:34.019Z] nckVersion col=32 line=1 m26       req=12 08 82 01 00 20 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝)
+
+=== 第一步 B：AXIS_NAME 基准（N 区 col=10000，生产探针常量）===
+[2026-10-29T08:53:34.023Z] AXIS_NAME line=1                   req=12 08 82 01 27 10 00 01 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 58 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MX1")
+[2026-10-29T08:53:34.027Z] AXIS_NAME line=2                   req=12 08 82 01 27 10 00 02 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 59 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MY1")
+[2026-10-29T08:53:34.035Z] AXIS_NAME line=3                   req=12 08 82 01 27 10 00 03 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 5a 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MZ1")
+[2026-10-29T08:53:34.042Z] AXIS_NAME line=4                   req=12 08 82 01 27 10 00 04 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 53 50 31 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MSP1")
+[2026-10-29T08:53:34.048Z] AXIS_NAME line=5                   req=12 08 82 01 27 10 00 05 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 41 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MA1")
+[2026-10-29T08:53:34.052Z] AXIS_NAME line=6                   req=12 08 82 01 27 10 00 06 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 42 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MB1")
+[2026-10-29T08:53:34.056Z] AXIS_NAME line=7                   req=12 08 82 01 27 10 00 07 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 43 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MC1")
+[2026-10-29T08:53:34.059Z] AXIS_NAME line=8                   req=12 08 82 01 27 10 00 08 1a 01 | ret=0xFF | transport=0x09 | len=16 | data=4d 51 31 00 00 00 00 00 00 00 00 00 00 00 00 00 | decode=OK String("MQ1")
+    → AXIS_NAME 基准 8/8 通过；轴名=1:MX1, 2:MY1, 3:MZ1, 4:MSP1, 5:MA1, 6:MB1, 7:MC1, 8:MQ1
+
+=== 第二步：maxnumChannels（N col=4 line=1，TYPE_UWORD）===
+[2026-10-29T08:53:34.062Z] maxnumChannels m26 [沿用假设]          req=12 08 82 01 00 04 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝)
+    → module=26 读取失败（保留真实错误，继续下一个候选）
+[2026-10-29T08:53:34.066Z] maxnumChannels m127 [备选（逐个尝试，非盲扫）] req=12 08 82 01 00 04 00 01 7f 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝)
+    → module=127 读取失败（保留真实错误，继续下一个候选）
+    → maxnumChannels 未取得（后续扫描无法定上界，将按 LINE_CAP=31 有界扫描并如实标注枚举不完整风险）
+
+=== 第三步前置：numBAGs（N col=3 line=1，给 chanAssignment 定上界）===
+[2026-10-29T08:53:34.069Z] numBAGs col=3 line=1 m26           req=12 08 82 01 00 03 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝)
+    → numBAGs=None（读不到则不猜上界，判定会标注待核实）
+
+=== 第三步：chanAssignment（N col=21，line=1..=31，TYPE_UWORD）===
+--- 第 1 轮 ---
+[2026-10-29T08:53:34.075Z] chanAssignment R1 line=1           req=12 08 82 01 00 15 00 01 1a 01 | ret=0xFF | transport=0x09 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | verdict=READ_FAILED
+    !! line=1 即读取失败：module=26（沿用假设）或 column=21 在该设备上不成立；停止本轮扫描，不做盲扫
+    → 第 1 轮提前终止（见上），不再进行第二轮
+
+--- 两轮一致性：未做（第一轮未完成）---
+
+=== 第四步：通道存在性独立对照（C/<n>/S/progStatus col=13 m127）===
+[2026-10-29T08:53:34.077Z] C/1 progStatus                     req=12 08 82 41 00 0d 00 01 7f 01 | ret=0xFF | transport=0x09 | len=2 | data=05 00 | decode=OK U32(5) | cross=EXISTS progStatus=Some(5)
+[2026-10-29T08:53:34.080Z] C/2 progStatus                     req=12 08 82 42 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | cross=READ_FAILED
+[2026-10-29T08:53:34.082Z] C/3 progStatus                     req=12 08 82 43 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | cross=READ_FAILED
+[2026-10-29T08:53:34.085Z] C/4 progStatus                     req=12 08 82 44 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | cross=READ_FAILED
+[2026-10-29T08:53:34.088Z] C/5 progStatus                     req=12 08 82 45 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | cross=READ_FAILED
+[2026-10-29T08:53:34.091Z] C/6 progStatus                     req=12 08 82 46 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | cross=READ_FAILED
+[2026-10-29T08:53:34.094Z] C/7 progStatus                     req=12 08 82 47 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | cross=READ_FAILED
+[2026-10-29T08:53:34.098Z] C/8 progStatus                     req=12 08 82 48 00 0d 00 01 7f 01 | ret=0x0A | transport=0x00 | len=<none> | data=<none> | decode=LOCAL_REJECT(transport/长度不符或设备拒绝) | cross=READ_FAILED
+
+--- chanAssignment 与 progStatus 对照 ---
+    line=1   chanAssignment=READ_FAILED          progStatus可读=true  不一致/不可判定
+
+=== 汇总：四类判定分布（第 1 轮）===
+    ASSIGNED   : —
+    NOT_EXIST  : —
+    READ_FAILED: 1
+    UNDETERMINED: —
+    !! 本次未观察到任何 "返回 0 = 通道不存在" 的索引：该分类**未实测**，不得声称五项验证全部完成
+
+<<< 验证结束（只读：未写参数、未发控制、未启动采集任务）
+test live_chan_assignment_probe ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+```
+
+说明（附录 B）：
+- 该版本脚本在 `chanAssignment` line=1 读取失败后**提前终止**（"line=1 即读取失败 ⇒ 停止本轮扫描，不做盲扫"），
+  因此只发了 1 次 `chanAssignment` 请求。
+- 该版本对 `maxnumChannels` 试了 `module=26` 与 `module=127` 两个候选（逐个记录，非盲扫），
+  两者都返回 `ret=0xFF` 且长度不符 ⇒ 结论与定稿版一致。
+- 该版本还没有 `numBAGs`/`nckType`/`nckVersion` 的原始字节链路，故这些项在该次运行里只留下"被丢弃"的事实。
+
+---
+
+# 附：本文件的边界声明
+
+- 本文件记录的是**一次性只读验证**的结果，**不是**生产探针的验收证据，
+  **不**构成 `chanAssignment` / `maxnumChannels` 可用于生产采集的依据。
+- 本轮**未**改动 `r1.json`、`DIGESTS.lock`、`r1.meta.json`，**未**改动 `identity_spec.rs` 的 `PROBES_828D`、
+  **未**改动 `identity.rs`、**未**改生产库/`proto/`/前端。
+- 本轮**不宣称** `mode_group.op_mode` 可读（那是 `module=127` 的另一地址），
+  也**不宣称** `mode_groups` 树已可用。
+- `layout-derived` 的部分（§2 的 10 字节布局说明、请求字节的字段来源）**不是**设备证据；
+  设备证据只有 §3–§7 与两个附录里逐字记录的 `req=`/`data=`/`ret=` 行。
