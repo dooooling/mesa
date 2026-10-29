@@ -57,6 +57,24 @@ fn read_repo_file(rel: &str) -> String {
 }
 
 /// `r1.json` 的原始定义（**逐字投影**的比对基准；只读，绝不改写）。
+fn lock_digests() -> BTreeMap<String, String> {
+    let lock: Value = serde_json::from_str(&read_repo_file(
+        "drivers/sinumerik-nck/definitions/828d/DIGESTS.lock",
+    ))
+    .expect("DIGESTS.lock 必须是合法 JSON");
+    lock["entries"]
+        .as_array()
+        .expect("DIGESTS.lock 必须含 entries 数组")
+        .iter()
+        .map(|entry| {
+            (
+                entry["variable_id"].as_str().expect("variable_id").to_string(),
+                entry["digest"].as_str().expect("digest").to_string(),
+            )
+        })
+        .collect()
+}
+
 fn raw_latest_definitions() -> BTreeMap<String, Value> {
     let doc: Value = serde_json::from_str(&read_repo_file(
         "drivers/sinumerik-nck/definitions/828d/r2.json",
