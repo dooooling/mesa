@@ -9,8 +9,7 @@
 > 「用户沿哪条路径能找到它」，**不回答**「手册说它是什么」。任何地方都**不得**把它
 > 写成「手册分类」「已确认分类」或「权威分类」。
 >
-> 每条输出都带自证字段 `category_basis`，本轮恒为 `"navigation_rule"`；只有后续
-> 方案 B（正式定义修订 + `DIGESTS.lock`）落地后才允许变为 `"definition"`。
+> Revision 1 的兼容投影使用 `category_basis="navigation_rule"`。方案 B 已在 revision 2 落地：最新定义的 category 已进入 digest 与 `DIGESTS.lock`，对应 `category_basis="definition"`。
 
 ## 1. 输出字段
 
@@ -28,7 +27,7 @@
 
 - `category`：`cnc_variable` / `system_variable` / `machine_data` /
   `drive_parameter` / `unclassified` 五码之一；
-- `category_basis`：分类依据的**自证**标记，本轮唯一取值 `"navigation_rule"`。
+- `category_basis`：分类依据的**自证**标记，Revision 1 兼容投影取 `"navigation_rule"`；revision 2 正式定义取 `"definition"`。
 
 两个字段都是**投影期计算**的附加字段：不参与 `digest`、不写回定义、不出现在
 `DIGESTS.lock`；`identity-preview` 端点不受影响。
@@ -124,10 +123,9 @@
 2. 表与定义漂移（证据锚点不成立，如手册来源被删、MD 编号与符号不一致）；
 3. ID 被复用成别的对象。
 
-## 5. 后续（方案 B）
+## 5. Scheme B 已落地
 
-`TODO(方案 B)`：正式分类走定义修订（`revision` + `DIGESTS.lock`）建立权威字段；
-届时 `category_basis` 变为 `"definition"`，本表退化为历史对照，不得再被当作分类来源。
+`drivers/sinumerik-nck/definitions/828d/r2.json` 为 42 条定义发布正式 `category`，并通过 `DIGESTS.lock` 锁定摘要。此文档和 `catalog_category.rs` 只用于解释 revision 1 的历史导航规则；revision 2 以定义字段为唯一分类来源。
 本轮**不改** `r1.json`、不改前端、不改 `proto/`、不改 `crates/`。
 
 ## 6. 测试
