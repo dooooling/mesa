@@ -87,7 +87,7 @@ pub(crate) async fn definitions(
         Some(_) => return invalid_query("include_history 必须是 true 或 false"),
     };
 
-    // ③ cursor 与 variable_id 互斥（游标语义 = 上一页末条，不能再叠加精确过滤）
+    // ④ cursor 与 variable_id 互斥（游标语义 = 上一页末条，不能再叠加精确过滤）
     if q.cursor.is_some() && q.variable_id.is_some() {
         return invalid_query("cursor 与 variable_id 互斥");
     }
