@@ -1,0 +1,1214 @@
+{
+  "format_version": 1,
+  "family": "828d",
+  "binds_to": {
+    "definition_file": "r1.json",
+    "definition_blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062"
+  },
+  "availability_rules_version": 1,
+  "entries": [
+    {
+      "variable_id": "channel.program.status",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.16",
+        "page": 306,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/0/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/0/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "mode_group.op_mode",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.2.1",
+        "page": 89,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/1/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "mode_group",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/1/addressing"
+      },
+      "availability": {
+        "state": "hold",
+        "basis": [
+          "mode_group_enumeration_unproven",
+          "no_device_read"
+        ],
+        "reason_zh": "方式组（B 区）枚举未证明：手册只给位域位置，取值集合与含义未经核对，枚举未证明前不判 ready。"
+      }
+    },
+    {
+      "variable_id": "channel.program.name.main",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.27",
+        "page": 531,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/2/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/2/addressing"
+      },
+      "availability": {
+        "state": "hold",
+        "basis": [
+          "string_length_unproven",
+          "no_device_read"
+        ],
+        "reason_zh": "手册只给 TYPE_STRING，未给字符串长度与终止/填充语义，Mesa 侧传输长度无法从手册证实；长度未证实前不判 ready。"
+      }
+    },
+    {
+      "variable_id": "channel.program.name.active",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.24",
+        "page": 515,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/3/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/3/addressing"
+      },
+      "availability": {
+        "state": "hold",
+        "basis": [
+          "string_length_unproven",
+          "no_device_read"
+        ],
+        "reason_zh": "手册只给 TYPE_STRING，未给字符串长度与终止/填充语义，Mesa 侧传输长度无法从手册证实；长度未证实前不判 ready。"
+      }
+    },
+    {
+      "variable_id": "channel.program.line_number",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.24",
+        "page": 508,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/4/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/4/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "channel.program.block",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.24",
+        "page": 507,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/5/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/5/addressing"
+      },
+      "availability": {
+        "state": "hold",
+        "basis": [
+          "string_length_unproven",
+          "no_device_read"
+        ],
+        "reason_zh": "手册只给 TYPE_STRING，未给字符串长度与终止/填充语义，Mesa 侧传输长度无法从手册证实；长度未证实前不判 ready。"
+      }
+    },
+    {
+      "variable_id": "axis.position.commanded_mcs",
+      "revision": 1,
+      "unit": {
+        "value": "mm, inch, degree, user defined",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/6/cross_reference_202503/quoted_excerpt",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.20",
+        "page": 488,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/6/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel+axis",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/6/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "axis.position.actual_bcs",
+      "revision": 1,
+      "unit": {
+        "value": "mm, inch, degree, user defined",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/7/cross_reference_202503/quoted_excerpt",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.18",
+        "page": 387,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/7/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel+axis",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/7/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "channel.feed.actual",
+      "revision": 1,
+      "unit": {
+        "value": "mm/min, inch/min, user defined",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/8/cross_reference_202503/quoted_excerpt",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.16",
+        "page": 272,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/8/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/8/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "channel.feed.commanded",
+      "revision": 1,
+      "unit": {
+        "value": "mm/min, inch/min, user defined",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/9/cross_reference_202503/quoted_excerpt",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.16",
+        "page": 288,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/9/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/9/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "channel.feed.override",
+      "revision": 1,
+      "unit": {
+        "value": "%",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/10/cross_reference_202503/manual_stated_address/physical_unit",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.16",
+        "page": 292,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/10/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/10/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "spindle.speed.actual",
+      "revision": 1,
+      "unit": {
+        "value": "rev/min, user defined",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/11/cross_reference_202503/manual_stated_address/physical_unit",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.28",
+        "page": 536,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/11/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel+spindle",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/11/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "spindle.speed.commanded",
+      "revision": 1,
+      "unit": {
+        "value": "rev/min , m/min",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/12/cross_reference_202503/manual_stated_address/physical_unit",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.28",
+        "page": 537,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/12/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel+spindle",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/12/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "spindle.speed.override",
+      "revision": 1,
+      "unit": {
+        "value": "%",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/13/cross_reference_202503/manual_stated_address/physical_unit",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.28",
+        "page": 541,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/13/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel+spindle",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/13/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "channel.tool.number_active",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.16",
+        "page": 277,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/14/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/14/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "channel.r_parameter",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53370586B AC",
+        "version": "03/2025",
+        "section": "5.3.15",
+        "page": 219,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/15/cross_reference_202503"
+      },
+      "index_rule": {
+        "kind": "channel+argument:index",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/15/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read"
+        ],
+        "reason_zh": "语义有依据，但缺真实设备读取证明；无已知硬性阻断。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0021",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 39,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/16/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/16/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0027",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 43,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/17/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/17/addressing"
+      },
+      "availability": {
+        "state": "hold",
+        "basis": [
+          "device_read_rejected",
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "真机只读复测在 module 26 与 module 130 两条入口均被拒（单项码 0x85），该参数在本目标上的读取能力未证实。"
+      }
+    },
+    {
+      "variable_id": "drive.motor.temperature",
+      "revision": 1,
+      "unit": {
+        "value": "°C",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/18/notes",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 50,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/18/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/18/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0033",
+      "revision": 1,
+      "unit": {
+        "value": "%",
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/19/notes",
+        "status": "verified"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 48,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/19/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/19/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0031",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 46,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/20/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/20/addressing"
+      },
+      "availability": {
+        "state": "hold",
+        "basis": [
+          "device_read_rejected",
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "真机只读复测在 module 26 与 module 130 两条入口均被拒（单项码 0x85），该参数在本目标上的读取能力未证实。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0062",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 69,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/21/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/21/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0063",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 69,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/22/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/22/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0064",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 70,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/23/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/23/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0077",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 79,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/24/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/24/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0078",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 80,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/25/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/25/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0079",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 81,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/26/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/26/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0080",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 81,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/27/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/27/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0081",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 82,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/28/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/28/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0082",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 83,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/29/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/29/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0103",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 91,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/30/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/30/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.p0105",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 91,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/31/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/31/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0106",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 93,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/32/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/32/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0107",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 94,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/33/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/33/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.parameter.r0108",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 98,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries/34/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/34/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "语义有依据，但缺登记在册的真实设备读取证明；驱动对象编号入口（module 26 / 130）的权威性未定（open_gaps module26_vs_module130_instance_numbers），不判 ready。"
+      }
+    },
+    {
+      "variable_id": "drive.object.name",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "A5E53014702F AA",
+        "version": "07/2023",
+        "section": "4",
+        "page": 136,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries_without_manual_source/0/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "drive_object",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/35/addressing"
+      },
+      "availability": {
+        "state": "candidate",
+        "basis": [
+          "no_device_read",
+          "module_value_authority_unresolved"
+        ],
+        "reason_zh": "r1 挂的 measurement 指向 docs/evidence/nck-drive-object-readback.json，该文件自述 environment=\"Run MyVirtual Machine 1.6 / CNC-SW 6.25 SP2; not real 828D\"、hardware_validated=false，按仓库证据分级不能当作真机证据；实体 828D 对同一 p0199 地址确有只读成功记录（docs/evidence/nck-live-identity-probe.txt:52-69，两条入口各 8 个实例），但该记录未采集 CNC 软件版本，device_read_evidence.environment.cnc_software 无法如实填写，故不判 ready；驱动对象编号入口（module 26 / 130）的权威性亦未定。"
+      }
+    },
+    {
+      "variable_id": "axis.name",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "6FC5397-4DP40-6RA6",
+        "version": "07/2023",
+        "section": "5.1",
+        "page": 31,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries_without_manual_source/1/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "axis",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/36/addressing"
+      },
+      "availability": {
+        "state": "reference_only",
+        "basis": [
+          "identity_scope_only"
+        ],
+        "reason_zh": "身份探针条目（scope=identity）：只用于解析实例身份，不进入采集准入；目录保留 6 条是为了身份闭包完整，不代表可采集。"
+      }
+    },
+    {
+      "variable_id": "axis.ctrlout.module_number",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "6FC5397-4DP40-6RA6",
+        "version": "07/2023",
+        "section": "5.3",
+        "page": 364,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries_without_manual_source/2/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "axis",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/37/addressing"
+      },
+      "availability": {
+        "state": "reference_only",
+        "basis": [
+          "identity_scope_only"
+        ],
+        "reason_zh": "身份探针条目（scope=identity）：只用于解析实例身份，不进入采集准入；目录保留 6 条是为了身份闭包完整，不代表可采集。"
+      }
+    },
+    {
+      "variable_id": "axis.encoder.module_number",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "6FC5397-4DP40-6RA6",
+        "version": "07/2023",
+        "section": "5.3",
+        "page": 365,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries_without_manual_source/3/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "axis",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/38/addressing"
+      },
+      "availability": {
+        "state": "reference_only",
+        "basis": [
+          "identity_scope_only",
+          "measurement_retracted"
+        ],
+        "reason_zh": "身份探针条目（scope=identity）：只用于解析实例身份，不进入采集准入。该条挂的 measurement 来源 docs/evidence/nck-live-identity-probe.txt 并无「编码器驱动号」小节，已判定不成立（measurement_retracted），不得计入任何 ready 判定。"
+      }
+    },
+    {
+      "variable_id": "axis.ctrlout.type",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "6FC5397-4DP40-6RA6",
+        "version": "07/2023",
+        "section": "5.3",
+        "page": 364,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries_without_manual_source/4/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "axis",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/39/addressing"
+      },
+      "availability": {
+        "state": "reference_only",
+        "basis": [
+          "identity_scope_only"
+        ],
+        "reason_zh": "身份探针条目（scope=identity）：只用于解析实例身份，不进入采集准入；目录保留 6 条是为了身份闭包完整，不代表可采集。"
+      }
+    },
+    {
+      "variable_id": "channel.machine_axis_assignment",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "6FC5397-4DP40-6RA6",
+        "version": "07/2023",
+        "section": "5.2",
+        "page": 185,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries_without_manual_source/5/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "channel+argument:position",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/40/addressing"
+      },
+      "availability": {
+        "state": "reference_only",
+        "basis": [
+          "identity_scope_only"
+        ],
+        "reason_zh": "身份探针条目（scope=identity）：只用于解析实例身份，不进入采集准入；目录保留 6 条是为了身份闭包完整，不代表可采集。"
+      }
+    },
+    {
+      "variable_id": "axis.spindle_assignment",
+      "revision": 1,
+      "unit": {
+        "value": null,
+        "source_ref": null,
+        "status": "unknown"
+      },
+      "manual_location": {
+        "document_number": "6FC5397-4DP40-6RA6",
+        "version": "07/2023",
+        "section": "5.3",
+        "page": 451,
+        "source_ref": "docs/reference/828d-manual-cross-reference.json#/entries_without_manual_source/6/cross_reference_202307"
+      },
+      "index_rule": {
+        "kind": "axis",
+        "status": "verified",
+        "source_ref": "drivers/sinumerik-nck/definitions/828d/r1.json#/definitions/41/addressing"
+      },
+      "availability": {
+        "state": "reference_only",
+        "basis": [
+          "identity_scope_only"
+        ],
+        "reason_zh": "身份探针条目（scope=identity）：只用于解析实例身份，不进入采集准入；目录保留 6 条是为了身份闭包完整，不代表可采集。"
+      }
+    }
+  ]
+}

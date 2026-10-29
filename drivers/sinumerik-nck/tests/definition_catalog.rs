@@ -651,8 +651,13 @@ fn lookup_missing_revision_never_falls_back() {
 ///    模板注册表、模板类型、内嵌模板常量与模板路径**零引用**；
 /// ② **来源级**：`r1.json` 每条定义的 `source` 只指向手册 / 实测 / 身份探针 /
 ///    冻结向量，**不得**出现模板文件路径；
-/// ③ **无构建期生成**：定义目录内容恰为 {`r1.json`, `DIGESTS.lock`}——发行定义
-///    只能人工编写、随 PR 提交，不存在 codegen 产物或第二份真值。
+/// ③ **无构建期生成**：定义目录内容恰为 {`r1.json`, `DIGESTS.lock`, `r1.meta.json`}
+///    ——发行定义只能人工编写、随 PR 提交，不存在 codegen 产物或第二份真值。
+///    `r1.meta.json` 是 sidecar（单位/手册位置/索引规则/可用性判定），它**不是**
+///    定义的副本：内容与 `r1.json` 不重叠，且通过 `binds_to.definition_blob_sha1`
+///    单向绑定到那份定义（改定义不改 sidecar ⇒ 装载期直接失败，见
+///    `tests/definition_meta.rs`）。构建期不生成它，只有 CI 校验它
+///    （`tools/ci/check_definition_meta.py`）。
 ///
 /// NOTE：矩阵 #63③ 的原文是「构建后 `git status --short -- <definitions>` 为空」。
 /// 该断言无法在测试进程内可靠表达（未提交的 PR 工作树本来就与 HEAD 不同），
@@ -734,7 +739,11 @@ fn definitions_are_not_derived_from_presets() {
     names.sort();
     assert_eq!(
         names,
-        vec!["828d/DIGESTS.lock".to_string(), "828d/r1.json".to_string()],
+        vec![
+            "828d/DIGESTS.lock".to_string(),
+            "828d/r1.json".to_string(),
+            "828d/r1.meta.json".to_string()
+        ],
         "定义目录只允许人工编写的发行文件"
     );
     // 冻结 wire 向量只有一份（禁止复制第二份真值）。

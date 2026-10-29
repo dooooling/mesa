@@ -22,16 +22,18 @@
 //! （PR-B3：拒绝点在 `NckConnection::configure`，不在目录/预览）。少 6 条 +
 //! 浏览树仍 62 叶会形成两份真值，是被明令禁止的组合（DC §9.3-C′）。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mesa_core_types::ErrorKind;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::catalog_category::classify_category;
 use crate::compiler::{AddressCompiler, CompileError};
 use crate::definition::{
     CatalogError, DEFINITION_FORMAT_VERSION, DefinitionCatalog, DefinitionScope,
-    MIN_DEFINITION_REVISION, VariableDefinition,
+    EMBEDDED_DEFINITIONS_828D_R1, EMBEDDED_DEFINITIONS_828D_R1_META, MIN_DEFINITION_REVISION,
+    VariableDefinition, git_blob_sha1,
 };
 use crate::{DECLARED_FAMILIES, DRIVER_ID};
 
@@ -52,9 +54,16 @@ const PREVIEW_KEYS: [&str; 3] = ["family", "kind", "parameters"];
 /// 定义字段默认拒绝，避免新字段顺着 `serde` 泄漏到对外契约；删除法只对今天
 /// 已知的 6 个字段有效。
 ///
-/// 为什么不含 `unit`：它属原生字段白名单（`compiler.rs:45-58`）的一员，是原生
-/// 侧展示注解而非语义可见面；当前 42 条定义均未声明它（`r1.json` 实测 0 条），
-/// 因此排除它**不改变**今天的投影结果。
+/// 为什么不含 `unit`：定义侧的 `unit` 属原生字段白名单（`compiler.rs:45-58`）的
+/// 一员，是原生侧展示注解而非语义可见面；当前 42 条定义均未声明它（`r1.json`
+/// 实测 0 条），因此排除它**不改变**今天的投影结果。
+///
+/// NOTE(元数据块)：`unit` / `manual_location` / `index_rule` / `availability`
+/// 这四个键**不来自** `r1.json`，而是来自 sidecar（`r1.meta.json`），由
+/// [`project`] 在逐字投影之后追加（见 [`META_BLOCK_KEYS`]）。因此它们不在本
+/// 白名单内，也绝不参与「逐字投影」的比对；sidecar 的 `unit` 是
+/// `{value, source_ref, status}` 对象（带出处与状态），与定义侧那个原生
+/// `unit` 字符串**不是同一个东西**，不存在形状冲突。
 ///
 /// NOTE(投影期附加字段)：`category` / `category_basis` **不在此白名单内**——它们
 /// 不是定义字段（`r1.json` 里没有、也不会有，见 `catalog_category.rs` 的模块
@@ -76,6 +85,257 @@ const PROJECTED_KEYS: [&str; 14] = [
     "golden_ref",
     "digest",
 ];
+
+/// sidecar 元数据的格式版本（与 `r1.meta.json` 的 `format_version` 逐字一致）。
+pub const META_FORMAT_VERSION: u32 = 1;
+
+/// sidecar 的 `binds_to.definition_file` 唯一合法取值：sidecar 只能绑定同目录的
+/// `r1.json`（绑定别的文件等于声明了一份不存在的对应关系）。
+pub const META_DEFINITION_FILE: &str = "r1.json";
+
+/// `availability.state` 的四个合法取值（见 `r1.meta.json` 的判定表）。
+pub const AVAILABILITY_STATES: [&str; 4] = ["reference_only", "hold", "ready", "candidate"];
+
+/// 投影期追加的四个元数据块（顺序即插入顺序，内容来自 sidecar，逐字不改）。
+pub const META_BLOCK_KEYS: [&str; 4] = ["unit", "manual_location", "index_rule", "availability"];
+
+/// sidecar 元数据的装载结果：`(variable_id, revision) -> 元数据块`。
+///
+/// 为什么按 `(variable_id, revision)` 而不是只按 `variable_id` 建键：定义目录允许
+/// 同一 `variable_id` 并存多个 revision（见 `PaginationCursor` 的注释），元数据必须
+/// 跟着 revision 走，否则多 revision 时会把旧 revision 的判定贴到新 revision 上。
+#[derive(Debug, Clone)]
+pub struct DefinitionMeta {
+    family: String,
+    entries: BTreeMap<(String, u32), MetaEntry>,
+}
+
+/// 单条 sidecar 条目。
+///
+/// 四个块保持 `serde_json::Value` 原样：投影要求**逐字**透传（含字段顺序与 null
+/// 形态），一旦拆成强类型再序列化就会丢字段或改写形状；形状校验放在
+/// [`DefinitionMeta::validate_entry`] 里显式做。
+#[derive(Debug, Clone, Deserialize)]
+struct MetaEntry {
+    variable_id: String,
+    revision: u32,
+    unit: Value,
+    manual_location: Value,
+    index_rule: Value,
+    availability: Value,
+    /// 仅 `state="ready"` 时出现：真机读取证据（环境四要素 + scope）。
+    /// 缺省为 `None`（serde 的 `Option` + `default`）。
+    #[serde(default)]
+    device_read_evidence: Option<Value>,
+}
+
+/// sidecar 文档形状（顶层）。
+#[derive(Debug, Deserialize)]
+struct MetaDoc {
+    format_version: u32,
+    family: String,
+    binds_to: MetaBindsTo,
+    availability_rules_version: u32,
+    entries: Vec<MetaEntry>,
+}
+
+/// sidecar 与定义文件的绑定声明。
+#[derive(Debug, Deserialize)]
+struct MetaBindsTo {
+    definition_file: String,
+    definition_blob_sha1: String,
+}
+
+impl DefinitionMeta {
+    /// 编译期内嵌 sidecar（装载即校验：形状 + 绑定摘要 + 逐条形状）。
+    pub fn embedded() -> Result<Self, CatalogError> {
+        Self::load(
+            EMBEDDED_DEFINITIONS_828D_R1_META,
+            EMBEDDED_DEFINITIONS_828D_R1,
+        )
+    }
+
+    /// 从「sidecar 文本 + 定义文本」装载。
+    ///
+    /// `definitions_json` 只用于重算绑定摘要——**不**重新解析定义（定义由
+    /// `DefinitionCatalog` 负责，两处各算各的摘要正是为了交叉验证）。
+    ///
+    /// fail-closed：任何一条不成立都返回 `Err`，调用方据此让整个目录不可用，
+    /// 绝不「跳过坏条目继续投影」。
+    pub fn load(meta_json: &str, definitions_json: &str) -> Result<Self, CatalogError> {
+        let doc: MetaDoc = serde_json::from_str(meta_json)
+            .map_err(|e| CatalogError::MetaInvalid(format!("不是合法 JSON 或顶层形状不符：{e}")))?;
+        if doc.format_version != META_FORMAT_VERSION {
+            return Err(CatalogError::MetaInvalid(format!(
+                "format_version={} 不受支持（当前 {META_FORMAT_VERSION}）",
+                doc.format_version
+            )));
+        }
+        if doc.availability_rules_version == 0 {
+            return Err(CatalogError::MetaInvalid(
+                "availability_rules_version 必须 >= 1（0 表示未声明判定表版本）".into(),
+            ));
+        }
+        if doc.family.trim().is_empty() {
+            return Err(CatalogError::MetaInvalid("family 不能为空".into()));
+        }
+        if doc.binds_to.definition_file != META_DEFINITION_FILE {
+            return Err(CatalogError::MetaInvalid(format!(
+                "binds_to.definition_file=`{}`，只允许 `{META_DEFINITION_FILE}`",
+                doc.binds_to.definition_file
+            )));
+        }
+        // 绑定摘要：sidecar 描述的必须是**当前**这份定义。这是整个 sidecar 唯一
+        // 的防漂移锚点——r1.json 一改，这里立刻不成立。
+        let actual = git_blob_sha1(definitions_json);
+        if doc.binds_to.definition_blob_sha1 != actual {
+            return Err(CatalogError::MetaInvalid(format!(
+                "binds_to.definition_blob_sha1={} 与实算 r1.json blob {actual} 不一致",
+                doc.binds_to.definition_blob_sha1
+            )));
+        }
+        let mut entries = BTreeMap::new();
+        for entry in doc.entries {
+            Self::validate_entry(&entry)?;
+            let key = (entry.variable_id.clone(), entry.revision);
+            if entries.insert(key.clone(), entry).is_some() {
+                return Err(CatalogError::MetaInvalid(format!(
+                    "条目重复：{}@{}",
+                    key.0, key.1
+                )));
+            }
+        }
+        Ok(Self {
+            family: doc.family,
+            entries,
+        })
+    }
+
+    /// 单条形状校验：四个块必须是对象，`availability.state` 必须是四态之一、
+    /// `basis` 必须是非空字符串数组。
+    ///
+    /// NOTE：这里**只**做结构校验。单位/页码/判定表的语义规则在
+    /// `tools/ci/check_definition_meta.py`（M1–M8）里，且那份脚本是唯一权威——
+    /// 驱动侧只保证「不会把形状不对的东西投给调用方」，不重复实现判定表，
+    /// 避免两处规则漂移。
+    fn validate_entry(entry: &MetaEntry) -> Result<(), CatalogError> {
+        let where_ = format!("{}@{}", entry.variable_id, entry.revision);
+        for (name, block) in [
+            ("unit", &entry.unit),
+            ("manual_location", &entry.manual_location),
+            ("index_rule", &entry.index_rule),
+            ("availability", &entry.availability),
+        ] {
+            if !block.is_object() {
+                return Err(CatalogError::MetaInvalid(format!(
+                    "{where_} 的 `{name}` 必须是对象"
+                )));
+            }
+        }
+        let state = entry.availability.get("state").and_then(Value::as_str);
+        if !state.is_some_and(|s| AVAILABILITY_STATES.contains(&s)) {
+            return Err(CatalogError::MetaInvalid(format!(
+                "{where_} 的 availability.state 必须是 {AVAILABILITY_STATES:?} 之一，实际 {state:?}"
+            )));
+        }
+        let basis = entry.availability.get("basis").and_then(Value::as_array);
+        if !basis.is_some_and(|b| !b.is_empty() && b.iter().all(Value::is_string)) {
+            return Err(CatalogError::MetaInvalid(format!(
+                "{where_} 的 availability.basis 必须是非空的字符串数组"
+            )));
+        }
+        if let Some(ev) = &entry.device_read_evidence
+            && !ev.is_object()
+        {
+            return Err(CatalogError::MetaInvalid(format!(
+                "{where_} 的 device_read_evidence 必须是对象"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 与定义目录**双向**对齐：每条定义都有元数据，每条元数据都有定义。
+    ///
+    /// 单向检查不够：少了会让投影缺块（前端拿到半截数据），多了说明 sidecar 里
+    /// 躺着一条没人引用的判定（下次改定义时极易被当成仍然有效）。
+    pub fn verify_catalog(&self, catalog: &DefinitionCatalog) -> Result<(), CatalogError> {
+        let mut seen = 0usize;
+        for def in catalog.iter() {
+            if def.family != self.family {
+                return Err(CatalogError::MetaInvalid(format!(
+                    "sidecar family=`{}` 与定义 `{}` 的 family=`{}` 不一致",
+                    self.family, def.variable_id, def.family
+                )));
+            }
+            if !self
+                .entries
+                .contains_key(&(def.variable_id.clone(), def.revision))
+            {
+                return Err(CatalogError::MetaInvalid(format!(
+                    "定义 `{}`(rev {}) 在 sidecar 中没有元数据条目",
+                    def.variable_id, def.revision
+                )));
+            }
+            seen += 1;
+        }
+        if seen != self.entries.len() {
+            return Err(CatalogError::MetaInvalid(format!(
+                "sidecar 有 {} 条元数据，但目录只有 {seen} 条定义（存在无定义对应的孤儿条目）",
+                self.entries.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 取一条定义的元数据块（调用前应已跑过 [`Self::verify_catalog`]）。
+    fn entry(&self, variable_id: &str, revision: u32) -> Option<&MetaEntry> {
+        self.entries.get(&(variable_id.to_string(), revision))
+    }
+
+    /// **仅供 crate 内单测**：为任意（含合成的）目录造一份形状合法、内容为占位的
+    /// 元数据。
+    ///
+    /// 为什么需要它：分页/游标类单测用**合成目录**（同一 variable 多个 revision），
+    /// 真实 sidecar 不可能覆盖这些条目，而 sidecar 又不能为测试放宽。这里造占位
+    /// 块只为让「目录 + 元数据」同时成立、从而测到分页语义本身；占位内容不参与
+    /// 任何断言。集成测试（`tests/`）拿不到本函数（`#[cfg(test)]` 只在单测构建里存在）。
+    #[cfg(test)]
+    fn placeholder(catalog: &DefinitionCatalog) -> Self {
+        let mut entries = BTreeMap::new();
+        for def in catalog.iter() {
+            entries.insert(
+                (def.variable_id.clone(), def.revision),
+                MetaEntry {
+                    variable_id: def.variable_id.clone(),
+                    revision: def.revision,
+                    unit: serde_json::json!({
+                        "value": null, "source_ref": null, "status": "unknown"
+                    }),
+                    manual_location: serde_json::json!({
+                        "document_number": "-", "version": "-", "section": "-",
+                        "page": null, "source_ref": "-"
+                    }),
+                    index_rule: serde_json::json!({
+                        "kind": "none", "status": "unknown", "source_ref": "-"
+                    }),
+                    availability: serde_json::json!({
+                        "state": "candidate", "basis": ["no_device_read"],
+                        "reason_zh": "单测占位（合成目录没有 sidecar 条目）"
+                    }),
+                    device_read_evidence: None,
+                },
+            );
+        }
+        Self {
+            family: catalog
+                .iter()
+                .next()
+                .map(|d| d.family.clone())
+                .unwrap_or_default(),
+            entries,
+        }
+    }
+}
 
 /// 定义 API 的错误：**码 + `ErrorKind` + 消息**三件套。
 ///
@@ -168,25 +428,41 @@ impl std::error::Error for DefinitionApiError {}
 /// 入参是 Core 按 §4.1 组装并**逐字透传**的查询对象；本函数是查询语义的
 /// 唯一权威（Core 只判正整数、互斥与夹取，见 `core-api/src/driver_query.rs`）。
 pub fn catalog_json(request_json: &str) -> Result<String, DefinitionApiError> {
-    catalog_json_with_loader(request_json, DefinitionCatalog::embedded)
+    catalog_json_with_loaders(
+        request_json,
+        DefinitionCatalog::embedded,
+        DefinitionMeta::embedded,
+    )
 }
 
-/// 可注入目录装载器的目录端点（**仅为测试 fail-closed 路径**而存在）。
+/// 可同时注入「目录装载器」与「sidecar 装载器」的目录端点（测试 fail-closed 用）。
 ///
 /// 为什么需要这个缝：E7/E28 要求「注入损坏目录 ⇒ 503 `DEFINITION_DIGEST_MISMATCH`，
 /// 且绝不返回半截结果」。内嵌目录是编译期常量，测试无法在不改冻结数据文件的
 /// 前提下破坏它；因此把「装载」作为参数注入，生产路径仍只有
-/// `DefinitionCatalog::embedded()` 一条。装载失败时本函数**只**返回错误，
-/// 不产生任何目录字节。
-pub fn catalog_json_with_loader<F>(
+/// `DefinitionCatalog::embedded()` + `DefinitionMeta::embedded()` 一条。
+/// 装载失败时本函数**只**返回错误，不产生任何目录字节。
+///
+/// 两份数据都必须装载成功且**互相绑定成功**才产出任何字节：
+/// - sidecar 摘要与 `r1.json` 不符 ⇒ `DEFINITION_DIGEST_MISMATCH`（`Internal`）；
+/// - sidecar 与目录条目不能双向对齐 ⇒ 同上。
+///
+/// 这就是 fail-closed 的落点：与 `definition.rs` 的「任何一条定义不成立都让目录
+/// 整体不可用」完全同构，不存在「元数据缺一块就少返回一个字段」的中间态。
+pub fn catalog_json_with_loaders<C, M>(
     request_json: &str,
-    load: F,
+    load_catalog: C,
+    load_meta: M,
 ) -> Result<String, DefinitionApiError>
 where
-    F: FnOnce() -> Result<DefinitionCatalog, CatalogError>,
+    C: FnOnce() -> Result<DefinitionCatalog, CatalogError>,
+    M: FnOnce() -> Result<DefinitionMeta, CatalogError>,
 {
     let query = parse_catalog_query(request_json)?;
-    let catalog = load().map_err(DefinitionApiError::from_catalog)?;
+    let catalog = load_catalog().map_err(DefinitionApiError::from_catalog)?;
+    let meta = load_meta().map_err(DefinitionApiError::from_catalog)?;
+    meta.verify_catalog(&catalog)
+        .map_err(DefinitionApiError::from_catalog)?;
 
     // 系列过滤：先判「是否已声明」，再判「是否有定义」——两者的可区分性
     // 正是 E8 与 E9 的分界。
@@ -240,7 +516,7 @@ where
 
     let definitions = page
         .iter()
-        .map(|def| project(def))
+        .map(|def| project(def, &meta))
         .collect::<Result<Vec<_>, _>>()?;
 
     // 顶层 `family`：请求给了就回显；没给时若只有**一个**已发布系列则报它
@@ -539,13 +815,19 @@ fn published_families(catalog: &DefinitionCatalog) -> BTreeSet<String> {
 
 /// 单条定义的**语义可见面**投影（白名单 + 逐字取值，唯一例外是装载期计算的 `digest`）。
 ///
-/// 另外附加两个**导航字段**（不改变任何既有字段的语义与形状）：
-/// - `category`：前端建树用的分类码（`cnc_variable` / `system_variable` /
-///   `machine_data` / `drive_parameter` / `unclassified`）；
-/// - `category_basis`：该分类的依据，本轮恒为 `"navigation_rule"`——即「这是驱动侧
-///   临时导航规则，不是手册确认的分类」。方案 B（正式定义修订）后才允许变为
-///   `"definition"`。详见 `catalog_category.rs` 的模块文档。
-fn project(def: &VariableDefinition) -> Result<Value, DefinitionApiError> {
+/// 另外附加两类**非定义字段**（都不改变任何既有字段的语义与形状）：
+/// - 四个**元数据块** `unit` / `manual_location` / `index_rule` / `availability`
+///   （[`META_BLOCK_KEYS`]）：来自 sidecar，逐字透传，顺序与内容都不改。它们回答
+///   「这个变量在手册哪一页、单位是什么、下标怎么算、现在能不能采」——正是前端
+///   与运维要看的可见面，但**都不属于** `r1.json` 的定义内容。
+///   `availability.state="ready"` 时额外透传 `device_read_evidence`（真机读取证据）。
+/// - 两个**导航字段**：
+///   - `category`：前端建树用的分类码（`cnc_variable` / `system_variable` /
+///     `machine_data` / `drive_parameter` / `unclassified`）；
+///   - `category_basis`：该分类的依据，本轮恒为 `"navigation_rule"`——即「这是驱动侧
+///     临时导航规则，不是手册确认的分类」。方案 B（正式定义修订）后才允许变为
+///     `"definition"`。详见 `catalog_category.rs` 的模块文档。
+fn project(def: &VariableDefinition, meta: &DefinitionMeta) -> Result<Value, DefinitionApiError> {
     let full = serde_json::to_value(def).map_err(|e| {
         DefinitionApiError::internal(
             "DEFINITION_RESPONSE_INVALID",
@@ -568,6 +850,26 @@ fn project(def: &VariableDefinition) -> Result<Value, DefinitionApiError> {
         })?;
         out.insert(key.to_string(), value.clone());
     }
+    // 元数据块：必须**逐字**取自 sidecar（含 null 形态），因此直接克隆 `Value`，
+    // 不重建对象。找不到条目属构建期缺陷（装载期已双向对齐），此处 fail-closed。
+    let entry = meta.entry(&def.variable_id, def.revision).ok_or_else(|| {
+        DefinitionApiError::internal(
+            "DEFINITION_DIGEST_MISMATCH",
+            format!(
+                "定义 `{}`(rev {}) 缺少 sidecar 元数据条目（装载期对齐被绕过）",
+                def.variable_id, def.revision
+            ),
+        )
+    })?;
+    out.insert("unit".into(), entry.unit.clone());
+    out.insert("manual_location".into(), entry.manual_location.clone());
+    out.insert("index_rule".into(), entry.index_rule.clone());
+    out.insert("availability".into(), entry.availability.clone());
+    // 真机读取证据只对 ready 条目存在；不存在就**不出现**该键（不是空对象），
+    // 让「没有证据」与「证据为空」在 JSON 上不可混淆。
+    if let Some(ev) = &entry.device_read_evidence {
+        out.insert("device_read_evidence".into(), ev.clone());
+    }
     // 导航分类（附加字段，见函数文档）：`category_basis` 是自证字段，取值本轮
     // **恒为** `navigation_rule`，让任何消费者都能看出这不是手册事实。
     let assignment = classify_category(def);
@@ -584,7 +886,7 @@ pub fn preview_json(request_json: &str) -> Result<String, DefinitionApiError> {
     preview_json_with_loader(request_json, DefinitionCatalog::embedded)
 }
 
-/// 可注入目录装载器的预览端点（同 [`catalog_json_with_loader`]，供 E28 的
+/// 可注入目录装载器的预览端点（同 [`catalog_json_with_loaders`]，供 E28 的
 /// fail-closed 断言使用；生产路径仍只有内嵌目录一条）。
 pub fn preview_json_with_loader<F>(
     request_json: &str,
@@ -703,9 +1005,10 @@ mod tests {
     fn catalog_and_preview_are_fail_closed_on_self_check_failure() {
         let corrupted = || Err(CatalogError::Json("injected corruption".into()));
 
-        let err = catalog_json_with_loader(
+        let err = catalog_json_with_loaders(
             &serde_json::json!({ "family": "828d" }).to_string(),
             corrupted,
+            DefinitionMeta::embedded,
         )
         .expect_err("装载失败必须整体失败");
         assert_eq!(err.code(), "DEFINITION_DIGEST_MISMATCH");
@@ -783,8 +1086,14 @@ mod tests {
     }
 
     fn catalog_page(catalog: &DefinitionCatalog, query: &Value) -> Value {
-        let body = catalog_json_with_loader(&query.to_string(), || Ok(catalog.clone()))
-            .expect("目录查询应成功");
+        // 合成目录没有真实 sidecar 条目 ⇒ 用占位元数据（只为本文件的分页断言服务）。
+        let meta = DefinitionMeta::placeholder(catalog);
+        let body = catalog_json_with_loaders(
+            &query.to_string(),
+            || Ok(catalog.clone()),
+            || Ok(meta.clone()),
+        )
+        .expect("目录查询应成功");
         serde_json::from_str(&body).expect("目录响应必须是 JSON")
     }
 
@@ -872,8 +1181,10 @@ mod tests {
             "",
         ] {
             let query = serde_json::json!({ "cursor": bad }).to_string();
-            let err = catalog_json_with_loader(&query, || Ok(catalog.clone()))
-                .expect_err("非法游标必须被拒绝");
+            let meta = DefinitionMeta::placeholder(&catalog);
+            let err =
+                catalog_json_with_loaders(&query, || Ok(catalog.clone()), || Ok(meta.clone()))
+                    .expect_err("非法游标必须被拒绝");
             assert_eq!(err.code(), "INVALID_QUERY", "cursor={bad:?}");
             assert_eq!(err.kind().as_str(), "ConfigurationError");
         }

@@ -45,9 +45,13 @@ pub use compiler::{
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use definition::{
     AddressingRule, ArgType, ArgumentSpec, CatalogError, DEFINITION_FORMAT_VERSION,
-    DefinitionCatalog, DefinitionScope, DefinitionSource, DigestError, GoldenRef, IdentityKeySpec,
+    DefinitionCatalog, DefinitionScope, DefinitionSource, DigestError,
+    EMBEDDED_DEFINITIONS_828D_R1, EMBEDDED_DEFINITIONS_828D_R1_META, GoldenRef, IdentityKeySpec,
     InvalidRuleSpec, LockEntry, MIN_DEFINITION_REVISION, NativeFieldSource, SemanticsStatus,
-    SourceKind, VariableDefinition,
+    SourceKind, VariableDefinition, git_blob_sha1,
+};
+pub use definition_api::{
+    AVAILABILITY_STATES, DefinitionMeta, META_BLOCK_KEYS, META_DEFINITION_FILE, META_FORMAT_VERSION,
 };
 pub use fixture::{NckFixture, NckFixtureState};
 pub use identity_spec::{
