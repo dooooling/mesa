@@ -41,7 +41,7 @@ pub const DEFAULT_LIMIT: u32 = 100;
 pub const MAX_LIMIT: u32 = 500;
 
 /// 目录查询参数允许的键（DC §4.1 的五个参数）。
-const QUERY_KEYS: [&str; 5] = ["family", "variable_id", "revision", "limit", "cursor"];
+const QUERY_KEYS: [&str; 6] = ["family", "variable_id", "revision", "limit", "cursor", "include_history"];
 
 /// 预览请求信封允许的键（DC §5.1：只有这三个；`point_key` 正是要被算出来的东西）。
 const PREVIEW_KEYS: [&str; 3] = ["family", "kind", "parameters"];
@@ -300,6 +300,7 @@ struct CatalogQuery {
     revision: Option<u32>,
     limit: u32,
     cursor: Option<PaginationCursor>,
+    include_history: bool,
 }
 
 /// 分页游标：**完整排序键** `(variable_id, revision)`，对客户端不透明。
@@ -421,6 +422,13 @@ fn parse_catalog_query(request_json: &str) -> Result<CatalogQuery, DefinitionApi
     let cursor = optional_non_empty_string(obj, "cursor")?
         .map(|raw| PaginationCursor::parse(&raw))
         .transpose()?;
+    let include_history = match obj.get("include_history") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(other) => return Err(DefinitionApiError::invalid_query(format!(
+            "`include_history` 必须是布尔值，实际 {other}"
+        ))),
+    };
 
     // revision 与 variable_id 必须成对：只给 revision 等于「全目录过滤 revision」，
     // 语义不明确；只给 variable_id 则必须回落「最新 revision」，而冻结目录的
@@ -452,6 +460,7 @@ fn parse_catalog_query(request_json: &str) -> Result<CatalogQuery, DefinitionApi
         revision,
         limit,
         cursor,
+        include_history,
     })
 }
 
@@ -526,13 +535,17 @@ fn select_definitions<'a>(
         return Ok((vec![def], None));
     }
 
-    // 无 variable_id 的目录查询返回所有已发布 revision，分页排序键是
-    // (variable_id, revision)。消费端按 variable_id 选最新版本建树，并保留历史版本
-    // 供既有点位精确核验；这里不能去重，否则历史 revision 无法由目录客户端读取。
-    let defs: Vec<&VariableDefinition> = catalog
-        .iter_all()
-        .filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f))
-        .collect();
+    // 普通目录默认只列每个 variable_id 的最新版本，保持用户树不重复。
+    // include_history=true 仅供客户端建立 byRevision 索引、核验已有点位使用。
+    let defs: Vec<&VariableDefinition> = if query.include_history {
+        catalog.iter_all()
+            .filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f))
+            .collect()
+    } else {
+        catalog.iter()
+            .filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f))
+            .collect()
+    };
     let note = match (&query.family, defs.is_empty()) {
         (Some(f), true) => Some(format!(
             "系列 `{f}` 已在驱动中声明，但当前没有任何已发布定义（这是空目录，不是驱动故障）"
