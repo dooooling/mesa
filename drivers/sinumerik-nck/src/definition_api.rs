@@ -497,13 +497,20 @@ fn select_definitions<'a>(
     catalog: &'a DefinitionCatalog,
     query: &CatalogQuery,
 ) -> Result<(Vec<&'a VariableDefinition>, Option<String>), DefinitionApiError> {
-    if let (Some(variable_id), Some(revision)) = (&query.variable_id, query.revision) {
-        // D5/D6：命中即返回，miss 绝不回落（错误码由冻结的 lookup 决定）。
-        let def = catalog
-            .lookup(variable_id, revision)
-            .map_err(DefinitionApiError::from_compile)?;
-        // family 过滤与精确变量是**合取**：该变量不在请求系列内 ⇒ 对该系列而言
-        // 它不存在（404 UNKNOWN_VARIABLE），而不是「返回一个别的系列的定义」。
+    if let Some(variable_id) = &query.variable_id {
+        // 指定 revision 时精确读取历史版本；省略 revision 时只取该变量最新版本。
+        let def = if let Some(revision) = query.revision {
+            catalog.lookup(variable_id, revision)
+                .map_err(DefinitionApiError::from_compile)?
+        } else {
+            catalog.iter().find(|d| &d.variable_id == variable_id).ok_or_else(|| {
+                DefinitionApiError::new(
+                    ErrorKind::Address,
+                    "UNKNOWN_VARIABLE",
+                    format!("变量 `{variable_id}` 没有已发布定义"),
+                )
+            })?
+        };
         if let Some(f) = &query.family
             && &def.family != f
         {
