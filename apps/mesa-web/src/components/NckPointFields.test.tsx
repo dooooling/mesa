@@ -6,6 +6,11 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { NckPointFields, type NckPreviewFn } from "./NckPointFields";
+import {
+  catalogLeafIds,
+  selectVariableViaTree,
+  selectedCatalogLeafIds,
+} from "../test/catalogTreePick";
 import type { NckIdentityPreviewResponse } from "../nckCatalog";
 import type { NckDefinitionLike } from "../nckPointModel";
 import type { NckPointSelection } from "../deviceModel";
@@ -96,10 +101,9 @@ function renderFields(args: {
   return { onSubmit };
 }
 
+/** 选中变量：唯一入口是分类树（平铺下拉框已按评审要求移除）。 */
 function choose(variableId: string) {
-  fireEvent.change(screen.getByTestId("nck-variable-select"), {
-    target: { value: variableId },
-  });
+  selectVariableViaTree(variableId);
 }
 
 describe("P0-1：未选择变量不显示虚假错误", () => {
@@ -115,7 +119,10 @@ describe("P0-1：未选择变量不显示虚假错误", () => {
     // 的组合，因此不存在可提交按钮（也就没有可提交路径）。
     expect(screen.queryByTestId("nck-add-point")).toBeNull();
     expect(screen.queryByTestId("nck-point-key-empty")).toBeNull();
-    expect(screen.getByTestId("nck-variable-select")).toBeTruthy();
+    // 唯一选择入口 = 搜索框 + 分类树（不再有并列的平铺下拉框）。
+    expect(screen.getByTestId("nck-variable-search")).toBeTruthy();
+    expect(screen.getByTestId("catalog-tree")).toBeTruthy();
+    expect(screen.queryByTestId("nck-variable-select")).toBeNull();
   });
 
   it("selected_variable_without_definition_still_reports_real_error", () => {
@@ -149,17 +156,18 @@ describe("P0-1：未选择变量不显示虚假错误", () => {
 });
 
 describe("P1-1：变量选择可搜索（中文名称 / 变量 ID）", () => {
-  function optionValues(): string[] {
-    return Array.from(
-      (screen.getByTestId("nck-variable-select") as HTMLSelectElement).querySelectorAll("option"),
-    )
-      .map((o) => o.value)
-      .filter(Boolean);
+  // 搜索继续过滤**树中的条目**：断言口径从「下拉框的 option 集合」换成
+  // 「树里可见的叶子集合」，两者都表示"当前可选的变量集合"，语义等价。
+  function visibleLeaves(): string[] {
+    return catalogLeafIds();
   }
 
   const spindle = definition({
     variable_id: "syn.spindle.speed",
     label: { zh: "主轴转速", en: "Spindle speed" },
+    // 与 channel 定义区分开的必填参数：用于证明「搜索把条目过滤掉」时
+    // 已选变量本身没有被清空（表单仍是它的表单）。
+    arguments: [{ key: "index", label: "主轴号", value_type: "integer", required: true, min: 1, max: 10 }],
   });
   const channel = definition({
     variable_id: "syn.channel.status",
@@ -169,17 +177,17 @@ describe("P1-1：变量选择可搜索（中文名称 / 变量 ID）", () => {
   it("filters_by_chinese_label_and_variable_id", () => {
     const { preview } = installPreview();
     renderFields({ definitions: [spindle, channel], preview });
-    expect(optionValues()).toEqual(["syn.spindle.speed", "syn.channel.status"]);
+    expect(visibleLeaves()).toEqual(["syn.spindle.speed", "syn.channel.status"]);
 
     const search = screen.getByTestId("nck-variable-search");
     fireEvent.change(search, { target: { value: "主轴" } });
-    expect(optionValues()).toEqual(["syn.spindle.speed"]);
+    expect(visibleLeaves()).toEqual(["syn.spindle.speed"]);
 
     fireEvent.change(search, { target: { value: "channel.status" } });
-    expect(optionValues()).toEqual(["syn.channel.status"]);
+    expect(visibleLeaves()).toEqual(["syn.channel.status"]);
 
     fireEvent.change(search, { target: { value: "不存在的变量" } });
-    expect(optionValues()).toEqual([]);
+    expect(visibleLeaves()).toEqual([]);
     expect(screen.getByTestId("nck-variable-search-count").textContent).toContain(
       "没有匹配的变量",
     );
@@ -189,13 +197,21 @@ describe("P1-1：变量选择可搜索（中文名称 / 变量 ID）", () => {
     const { preview } = installPreview();
     renderFields({ definitions: [spindle, channel], preview });
     choose("syn.spindle.speed");
+    // 选中态由树自身标记（叶子 data-selected）。
+    expect(selectedCatalogLeafIds()).toEqual(["syn.spindle.speed"]);
+
     fireEvent.change(screen.getByTestId("nck-variable-search"), {
       target: { value: "通道" },
     });
-    // 已选变量必须仍在下拉中：否则 select 会显示为空，用户会以为选择被清掉。
-    expect(optionValues()).toEqual(["syn.spindle.speed", "syn.channel.status"]);
-    expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe(
-      "syn.spindle.speed",
+    // 搜索只过滤树里的条目（spindle 不再出现在树上）……
+    expect(visibleLeaves()).toEqual(["syn.channel.status"]);
+    // ……但**不得清空已选变量**：表单仍是 spindle 的定义表单（它的必填参数 index 在），
+    // 且不会误报「定义缺失」。旧实现用「把已选项补回下拉首项」达到同样目的，
+    // 现在由「选中状态与搜索结果解耦」保证，用户不会以为选择被清掉。
+    expect(screen.getByLabelText("argument-index")).toBeTruthy();
+    expect(screen.queryByTestId("nck-definition-missing")).toBeNull();
+    expect(screen.getByTestId("nck-variable-search-count").textContent).toContain(
+      "匹配 1 个变量",
     );
   });
 });
@@ -322,11 +338,9 @@ describe("门禁 3：identity 不可新增（Preview 成功也不放行）", () 
       },
     });
     // 即使父层把 identity 定义塞进表单（绕过列表过滤/直接用初始点位注入），
-    // 这里也必须拒绝；select 里不再提供 identity 选项，但 definition 仍能显示原因。
-    const optionValues = Array.from(
-      (screen.getByTestId("nck-variable-select") as HTMLSelectElement).querySelectorAll("option"),
-    ).map((o) => o.value);
-    expect(optionValues).not.toContain("syn.channel.status");
+    // 这里也必须拒绝；树上不再提供 identity 叶子（可选项集合里没有它），
+    // 但 definition 仍能显示原因。
+    expect(catalogLeafIds()).not.toContain("syn.channel.status");
     expect(screen.getByTestId("nck-scope-reject").textContent).toContain("SCOPE_IDENTITY");
     expect(pending).toHaveLength(0);
     expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);

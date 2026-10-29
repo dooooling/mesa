@@ -191,18 +191,6 @@ export function NckPointFields({
       return variableId.includes(needle) || label.includes(needle) || en.includes(needle);
     });
   }, [selectableDefinitions, query]);
-  // 已选变量必须始终留在下拉里：搜索词把它过滤掉时补回首项，避免
-  // `<select value>` 找不到匹配项而视觉上变成“未选择”（状态其实还在）。
-  const visibleDefinitions = useMemo(() => {
-    if (!selectedId) return filteredDefinitions;
-    if (filteredDefinitions.some((item) => String(item.variable_id) === selectedId)) {
-      return filteredDefinitions;
-    }
-    const selected = selectableDefinitions.find(
-      (item) => String(item.variable_id) === selectedId,
-    );
-    return selected ? [selected, ...filteredDefinitions] : filteredDefinitions;
-  }, [filteredDefinitions, selectedId, selectableDefinitions]);
   const initialModel = useMemo(
     () =>
       buildNckFormModel(
@@ -505,7 +493,14 @@ export function NckPointFields({
     onDirtyChange?.(hasDraftInput);
   }, [hasDraftInput, onDirtyChange]);
 
-  /** 变量选择入口：搜索（跨分类）+ 列表 + 分类树；选中后才展示定义信息。 */
+  /**
+   * 变量选择入口：搜索（跨分类）+ 分类树。
+   *
+   * 这里刻意**只有一条**选择路径（评审要求）：搜索框过滤树中的条目，用户在树上
+   * 选中变量。历史上还并列过一个平铺的 `<select>`，它与树是同一批条目的两套入口，
+   * 只会让用户面对重复选择面，已移除；`selectedId`/`handleSelect` 仍由树驱动，
+   * 选中后的定义信息、分类标签、探测、预览与添加流程保持不变。
+   */
   const picker = (
     <div style={{ display: "grid", gap: 6 }}>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -519,20 +514,6 @@ export function NckPointFields({
           allowClear
           style={{ width: 260 }}
         />
-        <select
-          data-testid="nck-variable-select"
-          aria-label="可采集变量列表"
-          value={selectedId}
-          onChange={(e) => handleSelect(e.target.value)}
-          style={{ minWidth: 320, padding: "4px 6px" }}
-        >
-          <option value="">请选择可采集变量</option>
-          {visibleDefinitions.map((d) => (
-            <option key={String(d.variable_id)} value={String(d.variable_id)}>
-              {nckDefinitionLabel(d) || String(d.variable_id)}（{String(d.variable_id)}）
-            </option>
-          ))}
-        </select>
         {query.trim() ? (
           <span data-testid="nck-variable-search-count" style={{ fontSize: 12, color: "#525252" }}>
             {filteredDefinitions.length

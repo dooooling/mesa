@@ -13,6 +13,7 @@ import { message } from "antd";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import { buildAcquisition238, semanticPointKey, type AcquisitionFixture238 } from "../test/acquisitionFixture238";
 import { createRequestProbe, installProbedFetch } from "../test/requestProbe";
+import { selectVariableViaTreeWith } from "../test/catalogTreePick";
 import type { AcquisitionTaskShape, NckPointSelection } from "../deviceModel";
 
 const NCK_DRIVER = "sinumerik-nck";
@@ -210,7 +211,8 @@ describe("验收 1–3 + 6/7/9/10：238 点完整操作路径（首屏 → 搜�
     expect(document.querySelectorAll(".ant-form-item-explain-error")).toHaveLength(0);
     expect(screen.queryByTestId("nck-form-issues")).toBeNull();
     expect(document.body.textContent).not.toContain("FORM_MODEL_INVALID");
-    expect(screen.queryByTestId("nck-variable-select")).toBeNull();
+    // 抽屉未开 ⇒ 变量选择入口（搜索框 + 分类树）不渲染。
+    expect(screen.queryByTestId("catalog-tree")).toBeNull();
     expect(screen.getAllByTestId("nck-point-row")).toHaveLength(25);
     expect(pagination().textContent).toContain("共 238 项");
     expect(pagination().textContent).toContain("第 1 / 10 页");
@@ -351,17 +353,14 @@ describe("添加：抽屉 → 选中资源 → 填写 → 加入待保存列表 
     expect(screen.getByTestId("drawer-draft-notice").textContent).toBe(
       "确认后加入页面草稿，保存配置后生效。",
     );
-    await user.selectOptions(
-      (await screen.findByTestId("nck-variable-select")) as HTMLSelectElement,
-      "channel.feed.actual",
-    );
+    await selectVariableViaTreeWith(user, "channel.feed.actual");
     await user.type(screen.getByLabelText("target-channel"), "9");
     await screen.findByTestId("nck-point-key");
     expect(screen.getByTestId("nck-add-point").textContent).toContain("加入待保存列表");
     await user.click(screen.getByTestId("nck-add-point"));
 
     // 回到原位置：仍在第 5 页、滚动位置不变；新增只进草稿（零写请求）。
-    await waitFor(() => expect(screen.queryByTestId("nck-variable-select")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("catalog-tree")).toBeNull());
     expect(pagination().textContent).toContain("第 5 / 10 页");
     expect(screen.getByTestId("point-list-scroll").scrollTop).toBe(160);
     expect(screen.getByTestId("draft-save-summary").textContent).toBe("1 项点位变更（新增 1）");
@@ -459,10 +458,7 @@ describe("错误恢复：加载 /endpoints 失败 ⇒ 状态未知但草稿仍�
       ),
     );
     await user.click(screen.getByTestId("add-point-entry"));
-    await user.selectOptions(
-      (await screen.findByTestId("nck-variable-select")) as HTMLSelectElement,
-      "channel.program.status",
-    );
+    await selectVariableViaTreeWith(user, "channel.program.status");
     const target = screen.getByLabelText("target-channel");
     await user.type(target, "2");
     // 草稿仍可编辑：输入被接受（抽屉不被禁用）。

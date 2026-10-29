@@ -6,6 +6,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { NckSemanticPicker } from "./NckSemanticPicker";
 import type { NckPreviewFn } from "./NckPointFields";
 import type { NckDefinitionLike } from "../nckPointModel";
+import { selectVariableViaTree } from "../test/catalogTreePick";
 
 const definition: NckDefinitionLike = {
   variable_id: "syn.semantic",
@@ -45,9 +46,7 @@ describe("NckSemanticPicker（A21/A22）", () => {
     expect(screen.queryByText("手动")).toBeNull();
     expect(screen.queryByText("无可用资源")).toBeNull();
 
-    fireEvent.change(screen.getByTestId("nck-variable-select"), {
-      target: { value: "syn.semantic" },
-    });
+    selectVariableViaTree("syn.semantic");
     fireEvent.change(screen.getByLabelText("target-channel"), { target: { value: "1" } });
     await waitFor(() => expect(screen.getByTestId("nck-point-key")).toBeTruthy());
     fireEvent.click(screen.getByTestId("nck-add-point"));
