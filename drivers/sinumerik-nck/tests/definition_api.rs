@@ -62,16 +62,21 @@ fn lock_digests() -> BTreeMap<String, String> {
         "drivers/sinumerik-nck/definitions/828d/DIGESTS.lock",
     ))
     .expect("DIGESTS.lock 必须是合法 JSON");
-    lock["entries"]
+    let mut latest = BTreeMap::<String, (u64, String)>::new();
+    for entry in lock["entries"]
         .as_array()
         .expect("DIGESTS.lock 必须含 entries 数组")
-        .iter()
-        .map(|entry| {
-            (
-                entry["variable_id"].as_str().expect("variable_id").to_string(),
-                entry["digest"].as_str().expect("digest").to_string(),
-            )
-        })
+    {
+        let id = entry["variable_id"].as_str().expect("variable_id").to_string();
+        let revision = entry["revision"].as_u64().expect("revision");
+        let digest = entry["digest"].as_str().expect("digest").to_string();
+        if latest.get(&id).is_none_or(|(old_revision, _)| revision > *old_revision) {
+            latest.insert(id, (revision, digest));
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(id, (_, digest))| (id, digest))
         .collect()
 }
 
