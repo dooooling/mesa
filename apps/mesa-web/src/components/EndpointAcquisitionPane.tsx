@@ -2552,7 +2552,7 @@ export function EndpointAcquisitionPane({
                   <div style={{ marginTop: 4, fontSize: 11 }} data-testid="nck-catalog-meta">
                     共 {definitionList.length} 条定义（其余为身份探针或缺少 scope，不可采集）
                     {" · "}目录：
-                    {catalog ? `${catalog.total} 条 / ${catalog.pages} 页 / rev ${catalog.revision}` : "注入目录"}
+                    {catalog ? `${Object.keys(definitions ?? {}).length} 个变量 / ${catalog.total} 个定义版本 / ${catalog.pages} 页 / 最新 rev ${catalog.revision}` : "注入目录"}
                     {" · "}Endpoint family：
                     {endpointFamilyState === "loading"
                       ? "读取中"
