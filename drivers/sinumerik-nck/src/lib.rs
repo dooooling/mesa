@@ -44,10 +44,10 @@ pub use compiler::{
 };
 pub use config::{NCK_DEFAULT_PORT, NckConnConfig};
 pub use definition::{
-    AddressingRule, ArgType, ArgumentSpec, CatalogError, DEFINITION_FORMAT_VERSION, DefinitionCategory,
-    DefinitionCatalog, DefinitionScope, DefinitionSource, DigestError, GoldenRef, IdentityKeySpec,
-    InvalidRuleSpec, LockEntry, MIN_DEFINITION_REVISION, NativeFieldSource, SemanticsStatus,
-    SourceKind, VariableDefinition,
+    AddressingRule, ArgType, ArgumentSpec, CatalogError, DEFINITION_FORMAT_VERSION,
+    DefinitionCatalog, DefinitionCategory, DefinitionScope, DefinitionSource, DigestError,
+    GoldenRef, IdentityKeySpec, InvalidRuleSpec, LockEntry, MIN_DEFINITION_REVISION,
+    NativeFieldSource, SemanticsStatus, SourceKind, VariableDefinition,
 };
 pub use fixture::{NckFixture, NckFixtureState};
 pub use identity_spec::{
