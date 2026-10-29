@@ -22,7 +22,7 @@
 //! （PR-B3：拒绝点在 `NckConnection::configure`，不在目录/预览）。少 6 条 +
 //! 浏览树仍 62 叶会形成两份真值，是被明令禁止的组合（DC §9.3-C′）。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mesa_core_types::ErrorKind;
 use serde_json::{Map, Value};
@@ -509,16 +509,20 @@ fn select_definitions<'a>(
     if let Some(variable_id) = &query.variable_id {
         // 指定 revision 时精确读取历史版本；省略 revision 时只取该变量最新版本。
         let def = if let Some(revision) = query.revision {
-            catalog.lookup(variable_id, revision)
+            catalog
+                .lookup(variable_id, revision)
                 .map_err(DefinitionApiError::from_compile)?
         } else {
-            catalog.iter().find(|d| &d.variable_id == variable_id).ok_or_else(|| {
-                DefinitionApiError::new(
-                    ErrorKind::Address,
-                    "UNKNOWN_VARIABLE",
-                    format!("变量 `{variable_id}` 没有已发布定义"),
-                )
-            })?
+            catalog
+                .iter()
+                .find(|d| &d.variable_id == variable_id)
+                .ok_or_else(|| {
+                    DefinitionApiError::new(
+                        ErrorKind::Address,
+                        "UNKNOWN_VARIABLE",
+                        format!("变量 `{variable_id}` 没有已发布定义"),
+                    )
+                })?
         };
         if let Some(f) = &query.family
             && &def.family != f
