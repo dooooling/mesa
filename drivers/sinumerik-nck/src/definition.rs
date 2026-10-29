@@ -428,7 +428,10 @@ impl DefinitionCatalog {
     }
 
     /// 从多个不可变 revision 文件和一个完整摘要锁装载。
-    pub fn load_multiple(definition_docs: &[&str], digests_json: &str) -> Result<Self, CatalogError> {
+    pub fn load_multiple(
+        definition_docs: &[&str],
+        digests_json: &str,
+    ) -> Result<Self, CatalogError> {
         if definition_docs.is_empty() {
             return Err(CatalogError::Json("至少需要一个定义文件".into()));
         }
@@ -439,11 +442,20 @@ impl DefinitionCatalog {
         }
         let mut locks = BTreeMap::new();
         for e in &lock.entries {
-            if locks.insert((e.variable_id.clone(), e.revision), e.digest.clone()).is_some() {
-                return Err(CatalogError::LockJson(format!("条目重复：{}@{}", e.variable_id, e.revision)));
+            if locks
+                .insert((e.variable_id.clone(), e.revision), e.digest.clone())
+                .is_some()
+            {
+                return Err(CatalogError::LockJson(format!(
+                    "条目重复：{}@{}",
+                    e.variable_id, e.revision
+                )));
             }
         }
-        let mut catalog = Self { by_id: BTreeMap::new(), locks };
+        let mut catalog = Self {
+            by_id: BTreeMap::new(),
+            locks,
+        };
         let mut family_seen: Option<String> = None;
         for raw in definition_docs {
             let doc: DefinitionDoc = serde_json::from_str(raw)
@@ -453,7 +465,10 @@ impl DefinitionCatalog {
             }
             if let Some(family) = &family_seen {
                 if family != &doc.family {
-                    return Err(CatalogError::Json(format!("定义文件 family 不一致：{family} 与 {}", doc.family)));
+                    return Err(CatalogError::Json(format!(
+                        "定义文件 family 不一致：{family} 与 {}",
+                        doc.family
+                    )));
                 }
             } else {
                 family_seen = Some(doc.family.clone());
@@ -461,13 +476,18 @@ impl DefinitionCatalog {
             for def in doc.definitions {
                 if def.family != doc.family {
                     return Err(CatalogError::InvalidDefinition {
-                        variable_id: def.variable_id.clone(), revision: def.revision,
-                        reason: format!("family `{}` 与文件声明 `{}` 不一致", def.family, doc.family),
+                        variable_id: def.variable_id.clone(),
+                        revision: def.revision,
+                        reason: format!(
+                            "family `{}` 与文件声明 `{}` 不一致",
+                            def.family, doc.family
+                        ),
                     });
                 }
                 if def.revision != doc.revision {
                     return Err(CatalogError::InvalidDefinition {
-                        variable_id: def.variable_id.clone(), revision: def.revision,
+                        variable_id: def.variable_id.clone(),
+                        revision: def.revision,
                         reason: format!("revision 与文件声明 `{}` 不一致", doc.revision),
                     });
                 }
@@ -566,7 +586,9 @@ impl DefinitionCatalog {
     /// 每个 variable_id 的最新已发布定义（用户目录 / 默认选择使用此视图）。
     /// 历史 revision 仍保留在目录中，可通过 lookup(id, revision) 精确读取。
     pub fn iter(&self) -> impl Iterator<Item = &VariableDefinition> {
-        self.by_id.values().filter_map(|revisions| revisions.last_key_value().map(|(_, d)| d))
+        self.by_id
+            .values()
+            .filter_map(|revisions| revisions.last_key_value().map(|(_, d)| d))
     }
 
     /// 所有已发布 revision 的稳定遍历（摘要锁核验、历史审计使用）。
@@ -816,7 +838,9 @@ fn validate_definition(def: &VariableDefinition) -> Result<(), CatalogError> {
         return Err(fail("revision >= 2 必须声明正式 category".into()));
     }
     if def.revision == 1 && def.category.is_some() {
-        return Err(fail("revision 1 已冻结，不得新增 category；请发布新 revision".into()));
+        return Err(fail(
+            "revision 1 已冻结，不得新增 category；请发布新 revision".into(),
+        ));
     }
     if def.family.trim().is_empty() {
         return Err(fail("family 不得为空".into()));
