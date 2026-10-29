@@ -2,7 +2,7 @@
 use mesa_driver_sdk::DriverConnection;
 use mesa_driver_sinumerik_nck::{NckConnConfig, NckConnection, PresetRegistry};
 use mesa_driver_sinumerik_nck::{NckFixture, NckFixtureState};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const ROOT: &str = "nck://identity";
 const AXES: &str = "nck://identity/axes";
@@ -77,6 +77,56 @@ fn reset_reads(fixture: &NckFixture) {
         .lock()
         .unwrap()
         .clear();
+}
+
+/// 轴页必须是**可选语义叶**，且实例只来自真实读数。
+///
+/// 这条直接钉住联动选择缺口的修复：轴节点不能只是不可选文件夹，否则前端
+/// 无法从载荷得到 `target.axis`，`axis.position.*` 永远选不到实际轴。
+#[tokio::test]
+async fn axis_page_returns_selectable_axis_instances_from_actual_reads() {
+    let fixture = NckFixture::spawn(recorded_state()).await;
+    let (axes, next) = connection(&fixture).browse(AXES, "", "", 50).await.unwrap();
+    // 证据夹具里只有 8 个真实轴；不得按 1..31 预设凭空生成第 9 个。
+    assert_eq!(axes.len(), 8, "轴实例只能来自实际读到的轴");
+    assert_eq!(next.as_deref(), Some("9"), "8 个轴之后游标指向 9");
+    assert!(
+        !axes.iter().any(|node| node.id == "nck://identity/axis/9"),
+        "不得生成未读到的轴"
+    );
+
+    let axis1 = axes
+        .iter()
+        .find(|node| node.id == "nck://identity/axis/1")
+        .expect("轴1必须存在");
+    assert_eq!(axis1.selection_mode, 2, "轴节点必须是可选语义叶");
+    assert!(!axis1.has_children, "轴节点只承担选择，不得同时可下钻");
+    let payload: Value = serde_json::from_str(&axis1.selection_payload_json).unwrap();
+    assert_eq!(payload["parameters"]["target"]["axis"], 1);
+    assert_eq!(payload["identity"]["keys"][0]["path"], "axis");
+    let applies = payload["identity"]["applies_to_variables"]
+        .as_array()
+        .expect("applies_to_variables 必须由定义目录算出");
+    assert!(
+        applies
+            .iter()
+            .any(|value| value == "axis.position.actual_bcs"),
+        "轴载荷必须适用于 axis.position.actual_bcs：{applies:?}"
+    );
+
+    // MB1（轴6）在证据里是 output_type=0 的未确认形态：轴本身仍可选，
+    // 但标签必须如实标出"未确认有效驱动输出"，不能伪装成已确认驱动对象。
+    let mb1 = axes
+        .iter()
+        .find(|node| node.id == "nck://identity/axis/6")
+        .expect("MB1（轴6）必须存在");
+    assert_eq!(mb1.selection_mode, 2, "MB1 仍是真实轴，可选");
+    assert!(mb1.label.contains("MB1"), "{}", mb1.label);
+    assert!(
+        mb1.label.contains("未确认有效驱动输出"),
+        "MB1 未确认形态必须可见：{}",
+        mb1.label
+    );
 }
 
 #[tokio::test]

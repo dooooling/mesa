@@ -95,15 +95,18 @@ function installPreview() {
 
 /** 探测桩：只服务驱动契约夹具导出的分支，其余分支如实返回 UNKNOWN_PARENT。 */
 function installProbe(
-  respond: (parent: string) => unknown = probeResponse,
+  respond: (parent: string, cursor?: string) => unknown = probeResponse,
 ) {
   const parents: string[] = [];
   (globalThis as { fetch?: unknown }).fetch = vi.fn(
     async (_url: string, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body ?? "{}")) as { parent?: string };
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        parent?: string;
+        cursor?: string;
+      };
       const parent = body.parent ?? "";
       parents.push(parent);
-      return respond(parent) as ReturnType<typeof probeResponse>;
+      return respond(parent, body.cursor ?? "") as ReturnType<typeof probeResponse>;
     },
   );
   return parents;

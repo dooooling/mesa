@@ -84,6 +84,107 @@
         }
       ]
     },
+    "nck://identity/axes": {
+      "next_cursor": "9",
+      "nodes": [
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":1}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/1",
+          "kind": "nck_variable",
+          "label": "MX1 · 轴1 → NC驱动1 · 已分配驱动输出 → SERVO_1",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":1}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":2}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/2",
+          "kind": "nck_variable",
+          "label": "MY1（主轴1） · 轴2 → NC驱动2 · 已分配驱动输出 → SERVO_2",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":2}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":3}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/3",
+          "kind": "nck_variable",
+          "label": "MZ1 · 轴3 → NC驱动3 · 已分配驱动输出 → SERVO_3",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":3}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":4}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/4",
+          "kind": "nck_variable",
+          "label": "MSP1（主轴1） · 轴4 → NC驱动4 · 已分配驱动输出 → SERVO_4",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":4}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":5}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/5",
+          "kind": "nck_variable",
+          "label": "MA1 · 轴5 → NC驱动5 · 已分配驱动输出 → SERVO_5",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":5}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":6}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/6",
+          "kind": "nck_variable",
+          "label": "MB1 · 轴6 → NC驱动6 · 未确认有效驱动输出 → 未确认对象",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":6}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":7}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/7",
+          "kind": "nck_variable",
+          "label": "MC1 · 轴7 → NC驱动7 · 已分配驱动输出 → SERVO_7",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":7}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":8}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/axis/8",
+          "kind": "nck_variable",
+          "label": "MQ1 · 轴8 → NC驱动8 · 已分配驱动输出 → SERVO_8",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.ctrlout.module_number\",\"axis.ctrlout.type\",\"axis.encoder.module_number\",\"axis.name\",\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"axis.spindle_assignment\"],\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"axis\":8}}}"
+        }
+      ]
+    },
     "nck://identity/channels": {
       "next_cursor": "9",
       "nodes": [

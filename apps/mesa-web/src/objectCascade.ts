@@ -302,6 +302,28 @@ export interface CascadeScanRequest {
 }
 
 /**
+ * early-stop 判据：所有**必填** key 都已有至少一个可选候选。
+ *
+ * 为什么可以停：每一级下拉只要求"存在一个能提供该 key 的候选"，后续分支再多
+ * 也不会让已找到的候选失效；继续扫描只会把等待时间花在无关子树上。
+ *
+ * 为什么 `drive_object` 例外：它的身份是 `{number, entry}` 信封，entry 子键不在
+ * `ObjectNeed` 里；提前停止可能漏掉"后面才有 entry 取值"的候选。这里保守地
+ * 不提前停，等完整扫描后再由 `optionsForKey` 按 subKey 精确过滤。
+ */
+function allRequiredKeysCovered(
+  needs: readonly ObjectNeed[],
+  options: readonly CascadeOption[],
+): boolean {
+  const required = needs.filter((need) => need.required).map((need) => need.kind);
+  if (required.length === 0) return false;
+  if (required.includes("drive_object")) return false;
+  return required.every((kind) =>
+    options.some((option) => option.blocked === null && option.provides.includes(kind)),
+  );
+}
+
+/**
  * 探测设备上的对象并整理成候选（广度优先遍历驱动的 browse 树）。
  *
  * 为什么是"遍历"而不是"猜某个固定分支"：驱动把对象按自己的树组织（通道树 /
@@ -325,7 +347,7 @@ export async function scanObjectCandidates(
   const queue: Array<{ parent: string; depth: number }> = [{ parent: "", depth: 0 }];
   const seenNode = new Set<string>();
 
-  while (queue.length && visited.size < maxParents) {
+  scan: while (queue.length && visited.size < maxParents) {
     const current = queue.shift()!;
     if (visited.has(current.parent)) continue;
     visited.add(current.parent);
@@ -368,6 +390,10 @@ export async function scanObjectCandidates(
         if ("diagnostic" in mapped) diagnostics.push(mapped.diagnostic);
         else options.push(mapped.option);
       }
+      // 所有必填 key 都有候选 ⇒ 停止 BFS。**已经发生的失败分支/诊断仍保留在
+      // `branches`/`diagnostics` 里**：提前停止只省掉"还没访问的分支"，绝不
+      // 抹掉"已经发现的失败"。
+      if (allRequiredKeysCovered(request.needs, options)) break scan;
       cursor = page.nextCursor ?? "";
     } while (cursor !== "" && pageIndex < maxPagesPerParent);
   }

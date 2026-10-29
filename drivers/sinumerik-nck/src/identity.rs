@@ -3,15 +3,18 @@
 //!
 //! 身份探针是**驱动内建诊断程序**（`identity_spec`），不查变量目录、
 //! 不依赖模板文件存在，也不构成“允许采集哪些地址”的白名单。
-use crate::browse_selection::CODE_UNKNOWN_PARENT;
+use crate::browse_selection::{CODE_PENDING_REVIEW, CODE_UNKNOWN_PARENT};
+use crate::compiler::POINT_KIND_VARIABLE;
 use crate::identity_instances::{CHANNELS, SPINDLES, channels_page, spindles_page};
 use crate::identity_spec::{
     AXIS_CTRLOUT_MODULE_NR, AXIS_CTRLOUT_TYPE, AXIS_NAME, AXIS_SPIND_ASSIGN, DRIVE_OBJECT_NAME,
     DRIVE_OBJECT_NAME_M130, IdentityProbeSpec, probes_for_family,
 };
-use crate::presets::{PresetRegistry, leaf_node_with};
+use crate::presets::{PresetRegistry, instance_coordinate_payload, leaf_node_with};
+use crate::targets::TargetKind;
 use crate::{NckClient, NckConnConfig, decode_value};
 use mesa_core_types::{ErrorKind, Value};
+use mesa_driver_protocol::browse_selection as wire;
 use mesa_driver_protocol::pb::{BrowseDiagnosticSeverity, BrowseNode};
 use mesa_driver_sdk::SdkDriverError;
 
@@ -227,28 +230,61 @@ async fn axis(client: &mut NckClient, index: u16) -> Result<Option<AxisIdentity>
     }))
 }
 
-fn axis_node(axis: &AxisIdentity) -> BrowseNode {
+/// 轴实例 → **可选语义叶**（`has_children = false`）。
+///
+/// 为什么必须是语义叶而不是文件夹：联动选择需要的是 `axis` 坐标本身，
+/// 载荷由 [`instance_coordinate_payload`] 从真实定义目录构造（`target.axis` +
+/// `identity.keys=[axis]`），而不是前端从节点 id/标签里解析实例号。
+///
+/// `index` 只来自 [`axis`] 的真实读数（`AXIS_NAME` 等）；本函数不按 1..31
+/// 预设生成任何轴。定义目录不可用 / 没有只依赖 `axis` 的定义时返回诊断节点，
+/// 绝不发空载荷冒充可选。
+fn axis_node(family: &str, axis: &AxisIdentity) -> BrowseNode {
     let identity = match axis.spindle {
         Some(number) => format!("{}（主轴{number}）", axis.name),
         None => axis.name.clone(),
     };
-    let mut node = folder(
-        &format!("{ROOT}/axis/{}", axis.index),
-        &format!(
-            "{identity} · 轴{} → NC驱动{} · {} → {}",
-            axis.index,
-            axis.drive
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "未确认".into()),
-            if axis.output_type == 1 {
-                "已分配驱动输出"
-            } else {
-                "未确认有效驱动输出"
-            },
-            axis.object_name.as_deref().unwrap_or("未确认对象")
-        ),
+    let label = format!(
+        "{identity} · 轴{} → NC驱动{} · {} → {}",
+        axis.index,
+        axis.drive
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "未确认".into()),
+        if axis.output_type == 1 {
+            "已分配驱动输出"
+        } else {
+            "未确认有效驱动输出"
+        },
+        axis.object_name.as_deref().unwrap_or("未确认对象")
     );
-    node.has_children = axis.object_name.is_some();
+    let Some(payload) =
+        instance_coordinate_payload(family, TargetKind::Axis, u32::from(axis.index))
+    else {
+        return note(
+            format!("{ROOT}/note/axis-{}", axis.index),
+            CODE_PENDING_REVIEW,
+            format!(
+                "轴{}读数有效（{identity}），但定义目录没有只依赖 axis 的定义：载荷无法构造，需人工复核",
+                axis.index
+            ),
+            BrowseDiagnosticSeverity::Warning,
+        );
+    };
+    let selection = wire::semantic(payload.clone(), Vec::new());
+    let mut node = BrowseNode {
+        id: format!("{ROOT}/axis/{}", axis.index),
+        label,
+        kind: POINT_KIND_VARIABLE.into(),
+        data_type: String::new(),
+        access: "read".into(),
+        // 轴节点只承担"选择这个轴"；若将来需要下钻驱动对象，必须是**另一个**
+        // 兄弟导航节点，不能让同一个节点既可选又可下钻。
+        has_children: false,
+        binding_json: payload.clone(),
+        selection_mode: selection.mode as i32,
+        selection_payload_json: payload,
+        diagnostics: selection.diagnostics,
+    };
     if !axis.notes.is_empty() {
         node.label
             .push_str(&format!(" · {}", axis.notes.join("；")));
@@ -359,6 +395,7 @@ pub(crate) fn instance_cursor(cursor: &str) -> Result<u16, SdkDriverError> {
 /// 即使无匹配节点仍返回后续游标，避免一次搜索隐式扫描整个控制器。
 async fn instance_page(
     client: &mut NckClient,
+    family: &str,
     axes: bool,
     filter: &str,
     cursor: &str,
@@ -374,7 +411,7 @@ async fn instance_page(
         let result = if axes {
             axis(client, index)
                 .await
-                .map(|axis| axis.map(|value| axis_node(&value)))
+                .map(|axis| axis.map(|value| axis_node(family, &value)))
         } else {
             // 驱动对象列表走**显式驱动对象入口**（module 130）；它与 NC 变量
             // 入口（module 26）编号不同，两者不得互相换算。
@@ -504,8 +541,10 @@ pub async fn browse(
     }
     let mut client = NckClient::connect(cfg).await?;
     match target {
-        Target::Axes => instance_page(&mut client, true, filter, cursor, limit).await,
-        Target::Objects => instance_page(&mut client, false, filter, cursor, limit).await,
+        Target::Axes => instance_page(&mut client, &cfg.family, true, filter, cursor, limit).await,
+        Target::Objects => {
+            instance_page(&mut client, &cfg.family, false, filter, cursor, limit).await
+        }
         Target::Channels => channels_page(&mut client, &cfg.family, filter, cursor, limit).await,
         Target::Spindles => spindles_page(&mut client, &cfg.family, filter, cursor, limit).await,
         Target::Axis(index) => match axis(&mut client, index).await {

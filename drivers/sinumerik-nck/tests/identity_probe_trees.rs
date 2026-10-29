@@ -62,6 +62,107 @@ fn spindle_spec(axis: u8) -> Vec<u8> {
     ]
 }
 
+/// 轴名探针：N 区、column 10000、line = 轴号。
+fn axis_name_spec(axis: u8) -> Vec<u8> {
+    vec![0x12, 0x08, 0x82, 0x01, 0x27, 0x10, 0x00, axis, 0x1a, 0x01]
+}
+
+/// 轴驱动模块号探针：A 区 `area_unit = 3<<5 | 轴号`、column 30110、line 1。
+fn axis_module_spec(axis: u8) -> Vec<u8> {
+    vec![
+        0x12,
+        0x08,
+        0x82,
+        0x60 | axis,
+        0x75,
+        0x9e,
+        0x00,
+        0x01,
+        0x1a,
+        0x01,
+    ]
+}
+
+/// 轴输出类型探针：A 区、column 30130、line 1。
+fn axis_type_spec(axis: u8) -> Vec<u8> {
+    vec![
+        0x12,
+        0x08,
+        0x82,
+        0x60 | axis,
+        0x75,
+        0xb2,
+        0x00,
+        0x01,
+        0x1a,
+        0x01,
+    ]
+}
+
+/// 驱动对象名探针（**module 26**，轴路径核对入口）：
+/// V 区 `area_unit = 5<<5 | 驱动号`、column 199、25×U16BE。
+fn drive_name_spec(drive: u8) -> Vec<u8> {
+    vec![
+        0x12,
+        0x08,
+        0x82,
+        0xa0 | drive,
+        0x00,
+        0xc7,
+        0x00,
+        0x01,
+        0x1a,
+        0x19,
+    ]
+}
+
+fn utf8_fixed(text: &str, len: usize) -> Vec<u8> {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.resize(len, 0);
+    bytes
+}
+
+fn utf16be_fixed(text: &str, chars: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(chars * 2);
+    for unit in text.encode_utf16().take(chars) {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    bytes.resize(chars * 2, 0);
+    bytes
+}
+
+/// 契约场景里的 8 个真实轴（名称/驱动/输出类型/主轴分配来自真机证据形态）。
+///
+/// 轴6 = MB1、output_type=0：这是"轴名读到了，但驱动对象身份未确认"的形态，
+/// 轴本身仍是真实实例；前端必须能选到它，同时标签如实说明未确认。
+fn contract_axis_items() -> Vec<(Vec<u8>, ItemVector)> {
+    let axes = [
+        ("MX1", 1u8, 1u8, 0u8),
+        ("MY1", 2, 1, 1),
+        ("MZ1", 3, 1, 0),
+        ("MSP1", 4, 1, 1),
+        ("MA1", 5, 1, 0),
+        ("MB1", 6, 0, 2),
+        ("MC1", 7, 1, 0),
+        ("MQ1", 8, 1, 0),
+    ];
+    let mut items = Vec::new();
+    for (position, (name, drive, output_type, spindle)) in axes.iter().enumerate() {
+        let index = (position + 1) as u8;
+        items.push((axis_name_spec(index), (0xff, 9, utf8_fixed(name, 16))));
+        items.push((axis_module_spec(index), (0xff, 9, vec![*drive])));
+        items.push((axis_type_spec(index), (0xff, 9, vec![*output_type])));
+        items.push((spindle_spec(index), (0xff, 9, vec![*spindle])));
+        if *output_type == 1 {
+            items.push((
+                drive_name_spec(*drive),
+                (0xff, 6, utf16be_fixed(&format!("SERVO_{drive}"), 25)),
+            ));
+        }
+    }
+    items
+}
+
 /// 单项现场向量：返回码 + transport + 载荷。
 type ItemVector = (u8, u8, Vec<u8>);
 
@@ -483,9 +584,11 @@ async fn unknown_parent_is_a_stable_error_and_empty_parent_is_the_root() {
 // 4. 前端契约夹具：树 id 与节点形状由驱动产出，前端测试只消费
 // ---------------------------------------------------------------------------
 
-/// 夹具现场：3 个通道（其中 1 个"无法判定"）+ 2 个主轴（主轴1 由两根轴指向）。
+/// 夹具现场：8 个真实轴（含 MB1 未确认形态）+ 3 个通道（其中 1 个"无法判定"）
+/// + 2 个主轴（主轴1 由两根轴指向）。
 fn contract_scene() -> NckFixtureState {
-    state(vec![
+    let mut items = contract_axis_items();
+    items.extend(vec![
         (channel_spec(1), (0xff, 9, vec![1])),
         (channel_spec(2), (0xff, 9, vec![2])),
         // 通道3 位置1=0 ⇒ 无法判定（前端要能看到诊断，而不是"少了一个通道"）。
@@ -493,7 +596,8 @@ fn contract_scene() -> NckFixtureState {
         (spindle_spec(2), (0xff, 9, vec![1])),
         (spindle_spec(4), (0xff, 9, vec![1])),
         (spindle_spec(6), (0xff, 9, vec![2])),
-    ])
+    ]);
+    state(items)
 }
 
 /// 节点 → 与 Core REST 透传层**同形**的 JSON（`core-api::browse_nodes_json` 的字段集）。
@@ -540,6 +644,9 @@ async fn web_contract_fixture_matches_driver_browse_contract() {
         ("", 10u32),
         ("nck://presets", 6),
         (ROOT, 10),
+        // 轴页是联动选择 axis.* 的实例来源，必须导出；否则前端测试会再次
+        // 把"轴选不到"漏掉（本轮修复的直接盲区）。
+        (AXES, 8),
         (CHANNELS, 8),
         (SPINDLES, 50),
     ] {

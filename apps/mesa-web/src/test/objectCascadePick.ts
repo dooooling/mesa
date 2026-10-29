@@ -80,6 +80,7 @@ export function spindleNode(n: number): ContractNode {
  */
 export function probeResponse(
   parent: string,
+  cursor = "",
 ):
   | { ok: true; status: 200; json: () => Promise<unknown> }
   | { ok: false; status: 400; json: () => Promise<unknown> } {
@@ -92,6 +93,11 @@ export function probeResponse(
         error: { code: "UNKNOWN_PARENT", message: `未知的浏览父节点 \`${parent}\`` },
       }),
     };
+  }
+  // 契约夹具只导出每个 parent 的**首页**；后续页按驱动"分页到底"的行为返回空页，
+  // 绝不复读首页（否则会变成死循环，掩盖真正的分页处理）。
+  if (cursor !== "") {
+    return { ok: true, status: 200, json: async () => ({ nodes: [], next_cursor: null }) };
   }
   return { ok: true, status: 200, json: async () => page };
 }

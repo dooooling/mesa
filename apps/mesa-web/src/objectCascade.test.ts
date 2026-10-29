@@ -328,6 +328,54 @@ describe("探测扫描：广度优先、失败逐条记录、不抛异常", () =
     expect(scan.options).toHaveLength(1);
   });
 
+  it("stops_early_when_all_required_keys_are_covered_but_keeps_prior_failures", async () => {
+    const { scan, calls } = await scanFixture({
+      "": {
+        nodes: [
+          { ...CHANNELS_ROOT, id: "tree/failing" },
+          { ...CHANNELS_ROOT, id: "tree/a" },
+          { ...CHANNELS_ROOT, id: "tree/b" },
+        ],
+      },
+      // 先访问的失败分支必须保留；后面的 tree/b 不应再被访问。
+      "tree/failing": "fail",
+      "tree/a": {
+        nodes: [
+          semanticNode({ id: "a/1", target: { channel: 1 } }),
+          {
+            id: "a/note",
+            label: "通道1 无法判定",
+            kind: "diagnostic",
+            has_children: false,
+            selection_mode: 3,
+            selection_payload_json: "",
+            diagnostics: [{ code: "IDENTITY_PENDING_REVIEW", message: "无法判定", severity: 2 }],
+          },
+        ],
+      },
+      "tree/b": { nodes: [semanticNode({ id: "b/1", target: { channel: 2 } })] },
+    });
+    expect(calls).toEqual(["", "tree/failing", "tree/a"]);
+    expect(scan.options.map((option) => option.nodeId)).toEqual(["a/1"]);
+    // 提前停止不等于吞掉失败/诊断：已发现的失败分支与诊断仍在。
+    expect(scan.branches.filter((branch) => !branch.ok).map((branch) => branch.parent)).toEqual([
+      "tree/failing",
+    ]);
+    expect(scan.diagnostics.map((item) => item.code)).toEqual(["IDENTITY_PENDING_REVIEW"]);
+    expect(scan.incomplete).toBe(true);
+  });
+
+  it("does_not_stop_early_when_a_required_key_is_not_covered", async () => {
+    const { scan, calls } = await scanFixture({
+      "": { nodes: [{ ...CHANNELS_ROOT, id: "tree/a" }, { ...CHANNELS_ROOT, id: "tree/b" }] },
+      "tree/a": { nodes: [] },
+      "tree/b": { nodes: [] },
+    });
+    // 没有候选 ⇒ 必须把两棵子树都访问完，不能因为"访问过了"就提前收工。
+    expect(calls).toEqual(["", "tree/a", "tree/b"]);
+    expect(scan.options).toHaveLength(0);
+  });
+
   it("pagination_is_followed_for_the_same_parent", async () => {
     const { scan, calls } = await scanFixture({
       "": { nodes: [{ ...CHANNELS_ROOT, id: "tree/a" }], next_cursor: "c1" },
