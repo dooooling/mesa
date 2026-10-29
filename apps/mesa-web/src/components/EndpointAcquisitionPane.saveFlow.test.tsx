@@ -10,6 +10,7 @@ import { message } from "antd";
 import { EndpointAcquisitionPane, type NckDefinitionMap } from "./EndpointAcquisitionPane";
 import { NCK_POINTS_KIND, type AcquisitionTaskShape, type NckPointSelection } from "../deviceModel";
 import { selectVariableViaTreeWith } from "../test/catalogTreePick";
+import { pickObject, probeResponse } from "../test/objectCascadePick";
 import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
@@ -17,8 +18,8 @@ const EP = "ep-flow";
 const EP2 = "ep-flow-2";
 
 const DEFINITIONS: NckDefinitionMap = {
-  "syn.collect.a": {
-    variable_id: "syn.collect.a",
+  "channel.feed.actual": {
+    variable_id: "channel.feed.actual",
     revision: 1,
     family: "828d",
     scope: "collect",
@@ -27,8 +28,8 @@ const DEFINITIONS: NckDefinitionMap = {
     arguments: [],
     availability: CANDIDATE_AVAILABILITY,
   },
-  "syn.collect.b": {
-    variable_id: "syn.collect.b",
+  "channel.feed.commanded": {
+    variable_id: "channel.feed.commanded",
     revision: 1,
     family: "828d",
     scope: "collect",
@@ -172,6 +173,15 @@ function installFetch(state: MockState) {
       state.endpointCalls = 0;
       return ok({ ok: true });
     }
+    if (method === "POST" && url === `/api/v1/endpoints/${EP}/browse`) {
+      // 联动选择的按需探测：逐级候选来自驱动契约夹具（夹具只导出首页，后续页为空）。
+      const browseBody = JSON.parse(String(init?.body ?? "{}")) as {
+        parent?: string;
+        cursor?: string;
+      };
+      if ((browseBody.cursor ?? "") !== "") return ok({ nodes: [], next_cursor: null });
+      return probeResponse(browseBody.parent ?? "");
+    }
     return { ok: false, status: 404, json: async () => ({}) };
   });
 }
@@ -237,7 +247,7 @@ describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
     const state = mkState({
       // 第一台读成功（RUNNING），第二台读取失败。
       endpointStates: ["RUNNING", "fail"],
-      tasks: [nckTask([point("syn.collect.a", 1)])],
+      tasks: [nckTask([point("channel.feed.actual", 1)])],
     });
     installFetch(state);
     const view = renderPane(EP);
@@ -264,7 +274,7 @@ describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
   it("刷新状态：重新读取成功后转为已停止（不再是未知）", async () => {
     const state = mkState({
       endpointStates: ["fail", "STOPPED"],
-      tasks: [nckTask([point("syn.collect.a", 1)])],
+      tasks: [nckTask([point("channel.feed.actual", 1)])],
     });
     installFetch(state);
     renderPane();
@@ -286,7 +296,7 @@ describe("交付 1/2：运行态三态与「未知禁止保存」", () => {
       }
       if (url.startsWith("/api/v1/drivers/")) return ok({ resources: RESOURCES });
       if (url.startsWith("/api/v1/tasks?endpoint=")) {
-        return ok({ tasks: [nckTask([point("syn.collect.a", 1)])] });
+        return ok({ tasks: [nckTask([point("channel.feed.actual", 1)])] });
       }
       return { ok: false, status: 404, json: async () => ({}) };
     });
@@ -303,7 +313,7 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
   it("编辑不改 rowId；删除不重排；新增不复用旧号", async () => {
     const user = userEvent.setup();
     const state = mkState({
-      tasks: [nckTask([point("syn.collect.a", 1), point("syn.collect.b", 2)])],
+      tasks: [nckTask([point("channel.feed.actual", 1), point("channel.feed.commanded", 2)])],
     });
     installFetch(state);
     renderPane();
@@ -314,13 +324,14 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
     expect(initial.filter(Boolean)).toHaveLength(2);
     expect(new Set(initial).size).toBe(2);
 
-    // 1) 编辑第二行：point_key 从 syn.collect.b@channel=2 变成 ...=9，但 rowId 不变。
+    // 1) 编辑第二行：重新选择另一台实际对象（point_key 从
+    //    channel.feed.commanded@channel=2 变成 ...=1），但 rowId 不变。
     await user.click(within(rows()[1]!).getByTestId("point-row-edit"));
-    const input = await screen.findByLabelText("target-channel");
-    await user.clear(input);
-    await user.type(input, "9");
+    expect(screen.getByTestId("nck-object-selected-channel").getAttribute("data-value")).toBe("2");
+    fireEvent.click(screen.getByTestId("nck-object-reselect-channel"));
+    await pickObject("channel", "通道1");
     await waitFor(() =>
-      expect(screen.getByTestId("nck-point-key").textContent).toBe("syn.collect.b@channel=9"),
+      expect(screen.getByTestId("nck-point-key").textContent).toBe("channel.feed.commanded@channel=1"),
     );
     await user.click(screen.getByTestId("nck-add-point"));
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(2));
@@ -334,8 +345,8 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
 
     // 3) 新增一行：发新号，且不复用被删除的 initial[0]。
     await user.click(screen.getByTestId("add-point-entry"));
-    await selectVariableViaTreeWith(user, "syn.collect.a");
-    await user.type(screen.getByLabelText("target-channel"), "5");
+    await selectVariableViaTreeWith(user, "channel.feed.actual");
+    await pickObject("channel", "通道1");
     await screen.findByTestId("nck-point-key");
     await user.click(screen.getByTestId("nck-add-point"));
     await waitFor(() => expect(screen.getAllByTestId("nck-point-row")).toHaveLength(2));
@@ -349,11 +360,11 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
 describe("交付 4/5：完整配置回读与基线更新", () => {
   it("回读不一致（点位相同、周期没保存）⇒ 待核对、不报成功、不刷新基线、不重新 PUT", async () => {
     const user = userEvent.setup();
-    const original = nckTask([point("syn.collect.a", 1)], 1000);
+    const original = nckTask([point("channel.feed.actual", 1)], 1000);
     const state = mkState({
       tasks: [original],
       // 服务端仍是旧周期：点位一模一样，只比点位会误报成功。
-      readBack: [nckTask([point("syn.collect.a", 1)], 1000)],
+      readBack: [nckTask([point("channel.feed.actual", 1)], 1000)],
     });
     installFetch(state);
     renderPane();
@@ -400,7 +411,7 @@ describe("交付 4/5：完整配置回读与基线更新", () => {
   it("回读请求失败 ⇒ 待核对（不是成功），且不重新 PUT", async () => {
     const user = userEvent.setup();
     const state = mkState({
-      tasks: [nckTask([point("syn.collect.a", 1)])],
+      tasks: [nckTask([point("channel.feed.actual", 1)])],
       readBack: "fail",
     });
     installFetch(state);

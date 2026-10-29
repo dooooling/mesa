@@ -15,7 +15,10 @@
 //   4 unit.unknown：显示"单位未核实"，不显示假单位
 //   5 unit.verified：显示真实单位值
 //   6 availability 缺失：fail-closed 阻断且原因可见
-//   7 ready + 无对应对象：静态可用性与动态对象分开显示，不给虚假可用配置
+//   7 ready + 无对应对象：静态可用性与动态对象分开显示，缺参数明确阻断
+//
+// 参数来源：语义页**没有** Target 手填框，参数由"选中实际对象"时的驱动载荷自动填入
+// （探测桩服务驱动契约夹具，见 `src/test/objectCascadePick.ts`）。
 //
 // 约束（与验收口径一致）：
 // - 纯离线：不启服务、不连真机、不改配置、不碰生产库；全部请求由本文件 mock；
@@ -29,6 +32,7 @@ import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import { createRequestProbe, installProbedFetch } from "../test/requestProbe";
 import { NATIVE_RESOURCE } from "../test/acquisitionFixture238";
 import { READY_AVAILABILITY } from "../test/availabilityFixture";
+import { openCascade, pickObject, probeResponse } from "../test/objectCascadePick";
 
 const EP = "ep-availability";
 const DRIVER = "sinumerik-nck";
@@ -60,7 +64,12 @@ function definitionOf(overrides: Record<string, unknown>): Record<string, unknow
   };
 }
 
-/** 需要 channel 实例的语义变量（这样"填参 → 预览"这条链在每条流程里都成立）。 */
+/**
+ * 需要 channel 实例的语义变量（这样"选对象 → 填参 → 预览"这条链在每条流程里都成立）。
+ *
+ * 变量 id 取自驱动夹具的 `identity.applies_to_variables`：候选归属由驱动声明决定，
+ * 前端不按名字猜（见 `objectCascade.nodeBelongsToVariable`）。
+ */
 function channelDef(
   variableId: string,
   label: string,
@@ -79,7 +88,7 @@ function channelDef(
 }
 
 /** `hold`：暂缓 + 手册位置 + 已核实单位（流程 1 同时验证"原因可见"与"位置可查"）。 */
-const HOLD_DEF = channelDef("channel.feed.hold", "进给速度（暂缓）", {
+const HOLD_DEF = channelDef("channel.feed.commanded", "进给速度（暂缓）", {
   availability: {
     state: "hold",
     basis: ["no_device_read", "manual_unverified"],
@@ -96,7 +105,7 @@ const HOLD_DEF = channelDef("channel.feed.hold", "进给速度（暂缓）", {
 });
 
 /** `reference_only`：只作展示，不可作为普通采集点添加。 */
-const REFERENCE_DEF = channelDef("channel.reference.only", "参考变量", {
+const REFERENCE_DEF = channelDef("channel.program.block", "参考变量", {
   availability: {
     state: "reference_only",
     basis: ["identity_only"],
@@ -117,12 +126,12 @@ const UNIT_UNKNOWN_DEF = channelDef("channel.program.status", "程序状态", {
 });
 
 /** 完全没有 `availability` 字段：fail-closed 阻断且原因可见（流程 6）。 */
-const NO_AVAILABILITY_DEF = channelDef("channel.no.meta", "无可用性声明", {
+const NO_AVAILABILITY_DEF = channelDef("channel.program.name.main", "无可用性声明", {
   unit: { value: "mm", source_ref: "manual", status: "verified" },
 });
 
 /** `ready`：静态可用性已核实；本机是否真有对象由探测回答（流程 7）。 */
-const READY_DEF = channelDef("channel.ready.var", "已核实变量", {
+const READY_DEF = channelDef("channel.feed.override", "已核实变量", {
   availability: READY_AVAILABILITY,
 });
 
@@ -136,7 +145,7 @@ const CATALOG = [
 ];
 
 // ---------------------------------------------------------------------------
-// 2. 请求桩：目录 / 预览 / 探测（空页）/ 任务快照
+// 2. 请求桩：目录 / 预览 / 探测 / 任务快照
 // ---------------------------------------------------------------------------
 
 interface FlowState {
@@ -144,10 +153,12 @@ interface FlowState {
   putBodies: unknown[][];
   previewLog: Array<Record<string, unknown>>;
   browseLog: string[];
+  /** true ⇒ 探测一律返回空页（流程 7：探测成功但本机没有对象）。 */
+  browseEmpty: boolean;
 }
 
-function mkState(): FlowState {
-  return { tasks: [], putBodies: [], previewLog: [], browseLog: [] };
+function mkState(overrides: Partial<FlowState> = {}): FlowState {
+  return { tasks: [], putBodies: [], previewLog: [], browseLog: [], browseEmpty: false, ...overrides };
 }
 
 function ok(body: unknown) {
@@ -216,10 +227,13 @@ function installFetch(state: FlowState, probe: ReturnType<typeof createRequestPr
       return ok({ resources: [NATIVE_RESOURCE], resource_selection_methods: [] });
     }
     if (method === "POST" && url === `/api/v1/endpoints/${EP}/browse`) {
-      const body = JSON.parse(String(init?.body ?? "{}")) as { parent?: string };
+      const body = JSON.parse(String(init?.body ?? "{}")) as { parent?: string; cursor?: string };
       state.browseLog.push(body.parent ?? "");
       // 流程 7：驱动如实返回"该位置没有对象"（空页 ≠ 失败）。
-      return ok({ nodes: [], next_cursor: null });
+      if (state.browseEmpty) return ok({ nodes: [], next_cursor: null });
+      // 其余流程用驱动契约夹具的真实通道树（夹具只导出首页，后续页为空）。
+      if ((body.cursor ?? "") !== "") return ok({ nodes: [], next_cursor: null });
+      return probeResponse(body.parent ?? "");
     }
     if (url.startsWith("/api/v1/tasks?endpoint=")) {
       return ok({ tasks: state.tasks });
@@ -249,6 +263,12 @@ async function openDrawer(user: ReturnType<typeof userEvent.setup>) {
   await screen.findByTestId("catalog-tree");
 }
 
+/** 展开「技术详情」（默认折叠：手册位置 / 索引规则 / 静态-动态说明都在里面）。 */
+async function expandTechDetails() {
+  fireEvent.click(screen.getByText(/技术详情/));
+  await screen.findByTestId("nck-tech-details-body");
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -272,16 +292,16 @@ describe("流程 1：hold 条目可见、显示 reason_zh、且无法添加", ()
     await openDrawer(user);
 
     // ---- 树上：可见 + 可用性标记 + 原因直接可读（不靠 hover）----
-    const leaf = screen.getByTestId("catalog-tree-leaf-channel.feed.hold");
+    const leaf = screen.getByTestId("catalog-tree-leaf-channel.feed.commanded");
     expect(leaf.getAttribute("data-availability")).toBe("hold");
-    const tag = screen.getByTestId("catalog-tree-leaf-availability-channel.feed.hold");
+    const tag = screen.getByTestId("catalog-tree-leaf-availability-channel.feed.commanded");
     expect(tag.getAttribute("data-availability")).toBe("hold");
     expect(tag.textContent).toBe("暂缓");
     expect(
-      screen.getByTestId("catalog-tree-leaf-hold-reason-channel.feed.hold").textContent,
+      screen.getByTestId("catalog-tree-leaf-hold-reason-channel.feed.commanded").textContent,
     ).toContain("驱动无真机读取证据");
     // 手册位置（页码/章节）可查，但不占主视觉。
-    const manual = screen.getByTestId("catalog-tree-leaf-manual-channel.feed.hold");
+    const manual = screen.getByTestId("catalog-tree-leaf-manual-channel.feed.commanded");
     expect(manual.getAttribute("data-page")).toBe("272");
     expect(manual.getAttribute("data-section")).toBe("5.3.16");
     expect(manual.getAttribute("data-document")).toBe("A5E53370586B AC");
@@ -298,13 +318,15 @@ describe("流程 1：hold 条目可见、显示 reason_zh、且无法添加", ()
     expect(block.getAttribute("data-code")).toBe("AVAILABILITY_HOLD");
     expect(block.textContent).toContain("AVAILABILITY_HOLD");
     expect(block.textContent).toContain("驱动无真机读取证据");
-    // 表单里的手册位置同样可查（详情/tooltip 口径，不占主视觉）。
+    // 手册位置进「技术详情」：默认折叠不渲染，展开后可查（不占主视觉）。
+    expect(screen.queryByTestId("nck-manual-location")).toBeNull();
+    await expandTechDetails();
     expect(screen.getByTestId("nck-manual-location").getAttribute("data-page")).toBe("272");
 
-    // ---- 查看与配置仍可用（预览能算出身份），但**添加按钮不可用** ----
-    await user.type(screen.getByLabelText("target-channel"), "1");
+    // ---- 查看与配置仍可用（参数由驱动载荷自动填入），但**添加按钮不可用** ----
+    await pickObject("channel", "通道1");
     expect((await screen.findByTestId("nck-point-key")).textContent).toBe(
-      "channel.feed.hold@channel=i:1",
+      "channel.feed.commanded@channel=i:1",
     );
     const add = screen.getByTestId("nck-add-point") as HTMLButtonElement;
     expect(add.disabled).toBe(true);
@@ -330,10 +352,10 @@ describe("流程 2：reference_only 条目可见但不可作为普通点位添�
     await waitPaneReady();
     await openDrawer(user);
 
-    const leaf = screen.getByTestId("catalog-tree-leaf-channel.reference.only");
+    const leaf = screen.getByTestId("catalog-tree-leaf-channel.program.block");
     expect(leaf.getAttribute("data-availability")).toBe("reference_only");
     expect(
-      screen.getByTestId("catalog-tree-leaf-availability-channel.reference.only").textContent,
+      screen.getByTestId("catalog-tree-leaf-availability-channel.program.block").textContent,
     ).toBe("仅参考");
 
     await user.click(leaf);
@@ -346,9 +368,9 @@ describe("流程 2：reference_only 条目可见但不可作为普通点位添�
     expect(block.textContent).toContain("仅用于身份核对");
 
     // 预览照常可用（只读展示），但添加被阻断且零写请求。
-    await user.type(screen.getByLabelText("target-channel"), "1");
+    await pickObject("channel", "通道1");
     expect((await screen.findByTestId("nck-point-key")).textContent).toBe(
-      "channel.reference.only@channel=i:1",
+      "channel.program.block@channel=i:1",
     );
     const add = screen.getByTestId("nck-add-point") as HTMLButtonElement;
     expect(add.disabled).toBe(true);
@@ -392,7 +414,7 @@ describe("流程 3：candidate 可走流程，但添加处标注未验证", () =
     // candidate 不产生阻断告警（允许走流程 ≠ 伪装成已验证）。
     expect(screen.queryByTestId("nck-availability-block")).toBeNull();
 
-    await user.type(screen.getByLabelText("target-channel"), "1");
+    await pickObject("channel", "通道1");
     expect((await screen.findByTestId("nck-point-key")).textContent).toBe(
       "channel.feed.actual@channel=i:1",
     );
@@ -491,11 +513,11 @@ describe("流程 6：availability 缺失时 fail-closed 阻断并可见", () => 
     await waitPaneReady();
     await openDrawer(user);
 
-    const leaf = screen.getByTestId("catalog-tree-leaf-channel.no.meta");
+    const leaf = screen.getByTestId("catalog-tree-leaf-channel.program.name.main");
     expect(leaf.getAttribute("data-availability")).toBe("unavailable");
-    expect(screen.getByTestId("catalog-tree-leaf-availability-channel.no.meta").textContent).toBe(
-      "可用性未知",
-    );
+    expect(
+      screen.getByTestId("catalog-tree-leaf-availability-channel.program.name.main").textContent,
+    ).toBe("可用性未知");
 
     await user.click(leaf);
     expect((await screen.findByTestId("nck-availability")).getAttribute("data-state")).toBe(
@@ -507,10 +529,10 @@ describe("流程 6：availability 缺失时 fail-closed 阻断并可见", () => 
     expect(block.textContent).toContain("AVAILABILITY_MISSING");
     expect(block.textContent).toContain("fail-closed");
 
-    // 参数填全 + 服务端预览成功也不放行（不得默认放行）。
-    await user.type(screen.getByLabelText("target-channel"), "1");
+    // 参数由载荷填全 + 服务端预览成功也不放行（不得默认放行）。
+    await pickObject("channel", "通道1");
     expect((await screen.findByTestId("nck-point-key")).textContent).toBe(
-      "channel.no.meta@channel=i:1",
+      "channel.program.name.main@channel=i:1",
     );
     const add = screen.getByTestId("nck-add-point") as HTMLButtonElement;
     expect(add.disabled).toBe(true);
@@ -529,48 +551,52 @@ describe("流程 7：ready 但本机没有对应对象时不给虚假可用配�
   it("ready_static_state_and_dynamic_object_state_are_shown_separately", async () => {
     const user = userEvent.setup();
     const probe = createRequestProbe();
-    const state = mkState();
+    const state = mkState({ browseEmpty: true });
     installFetch(state, probe);
     renderPane();
     await waitPaneReady();
     await openDrawer(user);
 
-    const leaf = screen.getByTestId("catalog-tree-leaf-channel.ready.var");
+    const leaf = screen.getByTestId("catalog-tree-leaf-channel.feed.override");
     expect(leaf.getAttribute("data-availability")).toBe("ready");
-    expect(screen.getByTestId("catalog-tree-leaf-availability-channel.ready.var").textContent).toBe(
-      "可用",
-    );
+    expect(
+      screen.getByTestId("catalog-tree-leaf-availability-channel.feed.override").textContent,
+    ).toBe("可用");
 
     await user.click(leaf);
 
-    // 第一处：静态可用性（sidecar 结论）—— ready。
+    // 第一处：静态可用性（sidecar 结论）—— ready，留在主视觉。
     const staticRow = await screen.findByTestId("nck-availability");
     expect(staticRow.getAttribute("data-state")).toBe("ready");
     expect(staticRow.textContent).toContain("可用（ready）");
+
+    // 第二处：静态说明与动态对象状态 —— 收在「技术详情」里（默认折叠）。
+    expect(screen.queryByTestId("nck-availability-static-note")).toBeNull();
+    expect(screen.queryByTestId("nck-object-dynamic-state")).toBeNull();
+    await expandTechDetails();
     expect(screen.getByTestId("nck-availability-static-note").textContent).toContain(
       "与当前机床是否存在该对象无关",
     );
-
-    // 第二处：动态对象状态 —— 尚未探测确认（与静态结论各自独立）。
     const dynamicRow = screen.getByTestId("nck-object-dynamic-state");
     expect(dynamicRow.getAttribute("data-object-state")).toBe("unconfirmed");
     expect(dynamicRow.textContent).toContain("静态可用性不代表本机存在该对象");
 
-    // 探测：驱动如实返回空页 ⇒ 空态而不是"可选对象"，也不产生填参结论。
-    await user.click(screen.getByTestId("object-probe-open"));
-    expect((await screen.findByTestId("object-probe-empty")).textContent).toContain(
-      "没有返回任何对象",
-    );
-    expect(screen.queryByTestId("object-probe-applied")).toBeNull();
+    // 探测：驱动如实返回空页 ⇒ "探测成功但没有对象"，不是"失败"也不是"静默空"。
+    await openCascade("channel");
+    const missing = await screen.findByTestId("nck-cascade-missing");
+    expect(missing.getAttribute("data-reason")).toContain("no_candidates");
+    expect(missing.textContent).toContain("探测成功，但设备没有返回");
     expect(screen.queryByTestId("nck-fill-notice")).toBeNull();
     expect(screen.getByTestId("nck-object-dynamic-state").getAttribute("data-object-state")).toBe(
       "unconfirmed",
     );
 
     // 没有对象 ⇒ 没有可用配置：目标仍为空、无身份、按钮禁用（不给出虚假可用配置）。
-    expect((screen.getByLabelText("target-channel") as HTMLInputElement).value).toBe("");
+    expect(screen.getByTestId("nck-object-select-channel")).toBeTruthy();
+    expect(screen.queryByTestId("nck-object-selected-channel")).toBeNull();
     expect(screen.queryByTestId("nck-point-key")).toBeNull();
     expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+    // 根页就是空页 ⇒ 没有可下钻的分支，探测只发一次。
     expect(state.browseLog).toEqual([""]);
     expect(probe.count("PUT:tasks")).toBe(0);
   }, 60_000);

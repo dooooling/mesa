@@ -19,6 +19,7 @@ import { NckPointFields, type NckPreviewFn } from "./NckPointFields";
 import type { NckPointSelection } from "../deviceModel";
 import type { NckDefinitionLike } from "../nckPointModel";
 import { createNckSemanticHandler } from "../nckBrowseSemantic";
+import { objectProbeGate, type ObjectProbeGate } from "../objectProbe";
 import type { SchemaDescriptor } from "../types";
 
 /** 选型方式声明（来自 Descriptor.resource_selection_methods，缺省即 manual）。 */
@@ -36,6 +37,11 @@ export interface NckSemanticPickerProps {
   catalogFamily?: string | null;
   /** Descriptor variable 资源 Schema；提供时才开放高级原生页。 */
   nativeSchema?: SchemaDescriptor | null;
+  /**
+   * 探测入口可用性。缺省按"端点是否存在"推导：没有 Endpoint 的调用方
+   * （例如创建向导）必然不可探测，联动选择会明确阻断并给出下一步指引。
+   */
+  probeGate?: ObjectProbeGate;
   takenPointKeys?: string[];
   /** 语义点位加入回调；未提供时语义表单只读提示，不产生可提交点位。 */
   onAddPoint?: (point: NckPointSelection) => boolean;
@@ -57,6 +63,7 @@ export function NckSemanticPicker({
   endpointFamily,
   catalogFamily,
   nativeSchema,
+  probeGate,
   takenPointKeys,
   onAddPoint,
   preview,
@@ -67,6 +74,15 @@ export function NckSemanticPicker({
   const [preset, setPreset] = useState<NckPointSelection | null>(null);
   const [nonce, setNonce] = useState(0);
   const definitions = rawDefinitions ? [...rawDefinitions] : null;
+  // 没有 Endpoint 就没有可探测对象：探测闸门据此关闭（不发任何请求），
+  // 联动选择会明确提示"缺参数且无法探测"并给出下一步，而不是退回手填。
+  const resolvedProbeGate: ObjectProbeGate =
+    probeGate ??
+    objectProbeGate({
+      endpointId: endpointId ?? "",
+      endpointKnown: !!endpointId,
+      connectionKnown: !!endpointId,
+    });
 
   const semanticPane = !definitions ? (
     <div data-testid="nck-semantic-picker-no-definitions-body" style={{ fontSize: 12, color: "#525252" }}>
@@ -82,6 +98,8 @@ export function NckSemanticPicker({
       takenPointKeys={takenPointKeys ?? []}
       initialPoint={preset}
       nativeSchema={nativeSchema ?? null}
+      endpointId={endpointId ?? null}
+      probeGate={resolvedProbeGate}
       preview={preview}
       onSubmit={(point) => {
         const accepted = onAddPoint?.(point) ?? false;
