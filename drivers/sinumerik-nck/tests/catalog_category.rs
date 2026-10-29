@@ -118,7 +118,7 @@ async fn every_definition_declares_a_legal_navigation_category() {
             basis, "definition",
             "{id} 的最新 revision 必须由正式定义字段提供 category_basis=definition"
         );
-        for forbidden in ["definition", "manual", "verified", "authoritative"] {
+        for forbidden in ["manual", "verified", "authoritative"] {
             assert_ne!(
                 basis, forbidden,
                 "{id} 不得把导航分类伪装成 {forbidden} 级证据"
