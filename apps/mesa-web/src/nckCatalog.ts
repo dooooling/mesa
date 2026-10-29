@@ -88,7 +88,7 @@ export interface NckCatalogDefinition {
   golden_ref: NckCatalogGoldenRef[];
   digest: string;
   /**
-   * 导航分类（**投影期附加字段**，不进 digest、不改定义结构）。
+   * 导航分类（r2 起为正式定义字段；r1 兼容投影期导航规则）。
    *
    * 五码之一：`cnc_variable` / `system_variable` / `machine_data` /
    * `drive_parameter` / `unclassified`（drivers/sinumerik-nck/src/catalog_category.rs）。
