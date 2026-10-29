@@ -184,24 +184,30 @@ async fn browse_unsupported_for_s7_and_simulator() {
             .body(Body::from(r#"{"parent":"","limit":5}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // S7/test-driver 不支持 browse，应返回 503 或 400；且 body 不得是
-        // DRIVER_UNAVAILABLE（binary 缺失的假绿出口，前置 find_driver 已先拦一道）。
-        assert!(
-            resp.status() == StatusCode::SERVICE_UNAVAILABLE
-                || resp.status() == StatusCode::BAD_REQUEST,
-            "driver {driver} browse should be unsupported, got {}",
-            resp.status()
+        // S7/test-driver 不支持 browse：驱动在 IPC 上声明 `Unsupported`，
+        // REST 按**通用类别**映射为 501 NOT_IMPLEMENTED（本轮修复后的口径）。
+        //
+        // 之前这里放宽到「503 或 400」是因为 kind 在 Manager 边界被丢弃，
+        // REST 只能按码猜，于是"协议不支持"与"参数写错"不可区分。现在
+        // 类别一路到达 REST，状态码是确定的 501——因此断言收紧为精确值，
+        // 同时仍禁止 DRIVER_UNAVAILABLE 这条"binary 缺失"的假绿出口。
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "driver {driver} browse 不支持必须是 501（Unsupported 类别）"
         );
-        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
-            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let text = String::from_utf8_lossy(&body);
-            assert!(
-                !text.contains("DRIVER_UNAVAILABLE"),
-                "driver {driver} browse 503 必须是不支持语义，不得是驱动缺失：{text}"
-            );
-        }
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("DRIVER_UNAVAILABLE"),
+            "driver {driver} browse 501 必须是不支持语义，不得是驱动缺失：{text}"
+        );
+        assert!(
+            text.contains("UNSUPPORTED"),
+            "driver {driver} browse 必须透出驱动自己的稳定码：{text}"
+        );
     }
     std::fs::remove_dir_all(&root).ok();
 }

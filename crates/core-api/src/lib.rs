@@ -955,16 +955,41 @@ async fn browse_endpoint(
             )
         }
         Err(e) => {
-            let status = if e.code == "BROWSE_FAILED" || e.code == "DRIVER_UNAVAILABLE" {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
-            };
+            let status = browse_error_status(e.kind, &e.code);
             (
                 status,
                 Json(serde_json::json!({ "error": { "code": e.code, "message": e.message } })),
             )
         }
+    }
+}
+
+/// Browse 错误 → HTTP 状态：**有 kind 按通用类别映射，无 kind 沿用旧码白名单**。
+///
+/// 为什么要分两支：
+/// - 有 kind（驱动在 IPC 上声明过 `ErrorKind`）：状态码只由**通用类别**决定，
+///   复用全仓唯一映射点 [`driver_query::error_kind_to_status`]。这样"设备连不上"
+///   一律 503、"远端超时"一律 504、"父节点地址写错"一律 404/400，与是哪个驱动、
+///   码字面量叫什么无关——Core 因此不需要认识任何驱动的码表。
+/// - 无 kind（旧路径 / 会话级失败 / Manager 自造码）：保持既有白名单行为逐字不变，
+///   避免"新 Core + 旧行为"在升级瞬间改变已发布的接口契约。
+///
+/// 这里只允许出现 **Core 自己的码**（`BROWSE_FAILED` / `DRIVER_UNAVAILABLE`），
+/// 不得出现任何厂商码字面量——那是 P9 护栏（Core 零厂商语义）的红线。
+///
+/// NOTE: 本函数刻意放在 `browse_endpoint` **之后**：合同测试对 Browse 透传层的
+/// 源码扫描窗口是 `browse_nodes_json` → `async fn browse_endpoint`，本函数属于
+/// 错误映射而非节点透传，落在窗口外可避免被误判为透传层污染。
+fn browse_error_status(kind: Option<mesa_core_types::ErrorKind>, code: &str) -> StatusCode {
+    match kind {
+        // 驱动声明了通用类别 ⇒ 类别是唯一真值。
+        Some(k) => driver_query::error_kind_to_status(k),
+        // 无类别 ⇒ 旧行为：仅"驱动不可用/会话级失败"是基础设施问题（503），
+        // 其余仍按请求侧问题（400）处理。
+        None if code == "BROWSE_FAILED" || code == "DRIVER_UNAVAILABLE" => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        None => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -3844,5 +3869,85 @@ mod browse_json_tests {
         }]);
         assert_eq!(json[0]["selection_payload_json"], "");
         assert_eq!(json[0]["selection_mode"], 0);
+    }
+}
+
+#[cfg(test)]
+mod browse_error_status_tests {
+    use super::*;
+    use mesa_core_types::ErrorKind as K;
+
+    /// 回归主判据（本轮缺陷）：**驱动声明的通用类别**决定 HTTP 状态，
+    /// 而不是错误码是否恰好在某个白名单里。
+    ///
+    /// 缺陷现场：Manager 把 `SessionError::Driver { kind, .. }` 的 kind 丢弃，
+    /// 只透出 code/message，于是 REST 只能按码猜——"父节点写错"（配置类，400）
+    /// 与"设备连不上"（连接类，应为 503）、"探测超时"（超时类，应为 504）
+    /// 落到同一个 400。这三条用例锁住的就是这条区分。
+    #[test]
+    fn driver_declared_kind_wins_over_code_whitelist() {
+        // ① 配置类：父节点 id 写错 ⇒ 400（码是驱动自己的稳定码，Core 不解释它）
+        assert_eq!(
+            browse_error_status(Some(K::Configuration), "UNKNOWN_PARENT"),
+            StatusCode::BAD_REQUEST
+        );
+        // ② 连接类：连不上设备 ⇒ 503（**不是** 400）
+        assert_eq!(
+            browse_error_status(Some(K::Connection), "CONNECT_FAILED"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // ③ 超时类：远端探测超时 ⇒ 504（**不是** 400，也不是 503）
+        assert_eq!(
+            browse_error_status(Some(K::Timeout), "IDENTITY_TIMEOUT"),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    /// 其余通用类别的映射必须与 I-2 管理面**完全同源**（同一张表、同一函数）：
+    /// 地址类 404、不支持类 501、设备/协议/解码/内部 503。
+    ///
+    /// 这里刻意逐条钉死：若有人给 browse 另起一张表并"顺手"改动某一格，
+    /// 两条路径就会给出不同状态码，前端按状态分流的逻辑随之分裂。
+    #[test]
+    fn every_kind_maps_like_management_plane() {
+        let cases = [
+            (K::Configuration, StatusCode::BAD_REQUEST),
+            (K::Address, StatusCode::NOT_FOUND),
+            (K::Unsupported, StatusCode::NOT_IMPLEMENTED),
+            (K::Timeout, StatusCode::GATEWAY_TIMEOUT),
+            (K::Connection, StatusCode::SERVICE_UNAVAILABLE),
+            (K::Device, StatusCode::SERVICE_UNAVAILABLE),
+            (K::Protocol, StatusCode::SERVICE_UNAVAILABLE),
+            (K::Decode, StatusCode::SERVICE_UNAVAILABLE),
+            (K::Internal, StatusCode::SERVICE_UNAVAILABLE),
+        ];
+        for (kind, want) in cases {
+            // 码用驱动侧的真实码形（含下划线），证明状态与码字面量无关。
+            assert_eq!(
+                browse_error_status(Some(kind), "SOME_DRIVER_CODE"),
+                want,
+                "kind={kind:?} 的状态码必须与管理面同源"
+            );
+        }
+    }
+
+    /// 无 kind（旧路径 / Manager 自造码）必须**逐字保持**既有白名单行为：
+    /// 升级不能悄悄改掉已发布接口的状态码。
+    #[test]
+    fn legacy_whitelist_is_preserved_when_kind_is_absent() {
+        assert_eq!(
+            browse_error_status(None, "BROWSE_FAILED"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            browse_error_status(None, "DRIVER_UNAVAILABLE"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // 其它任何码（含驱动稳定码，此时类别未知）仍是 400。
+        assert_eq!(
+            browse_error_status(None, "UNKNOWN_PARENT"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(browse_error_status(None, ""), StatusCode::BAD_REQUEST);
     }
 }

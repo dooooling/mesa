@@ -26,10 +26,25 @@ struct CachedDescriptor {
 }
 
 /// Descriptor 获取错误（§4.4），映射为 REST 503 + error.code
+///
+/// `kind` 是**可选的通用错误类别**：Driver 在 IPC 上本就声明了 `ErrorKind`
+/// （见 `error_detail`），但早期实现只把 `code`/`message` 带出会话层，于是
+/// 「驱动声明的类别」在 Manager 边界被丢弃，REST 只能靠错误码白名单猜 HTTP
+/// 状态——同一个语义（连接失败 / 探测超时）在不同驱动下会落到不同状态码。
+///
+/// 为什么用 `Option` 而不是直接给 `ErrorKind`：本类型的既有构造点有 25 处
+/// （Descriptor 获取、OpenConnection 失败、会话级失败等），它们拿不到驱动
+/// 声明的类别。强制它们编造一个 kind 会让「驱动没说」与「驱动说是 Internal」
+/// 变得不可区分，也会无谓改动大量与本次缺陷无关的代码路径。因此
+/// [`DescriptorError::new`] 保持 `kind: None`（**既有行为逐字不变**），只有
+/// 真正拿到驱动类别的路径才用 [`DescriptorError::with_kind`]。
 #[derive(Debug, Clone)]
 pub struct DescriptorError {
     pub code: String,
     pub message: String,
+    /// `None` = 该错误路径没有驱动声明的类别（旧行为）；`Some` = 驱动声明过，
+    /// 调用方（REST）应据此按通用类别映射，而不是按错误码猜。
+    pub kind: Option<mesa_core_types::ErrorKind>,
 }
 
 impl DescriptorError {
@@ -37,6 +52,23 @@ impl DescriptorError {
         Self {
             code: code.into(),
             message: message.into(),
+            kind: None,
+        }
+    }
+
+    /// 带通用错误类别的构造：仅用于**驱动确实声明了类别**的路径。
+    ///
+    /// 语义上要求 `kind` 与 `code` 同源（都来自同一份 `pb::ErrorDetail`），
+    /// 不允许在这里"补充"驱动没说的类别。
+    fn with_kind(
+        code: impl Into<String>,
+        kind: mesa_core_types::ErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            kind: Some(kind),
         }
     }
 }
@@ -198,6 +230,22 @@ fn kind_from_wire(kind: &str) -> mesa_core_types::ErrorKind {
         "DeviceError" => K::Device,
         "Unsupported" => K::Unsupported,
         _ => K::Internal,
+    }
+}
+
+/// 驱动侧结构化错误（IPC `ErrorDetail` 的 kind/code/message）→ [`DescriptorError`]。
+///
+/// 为什么单独抽出来：这是"kind 过 Manager 边界"的**唯一**语义点，抽成纯函数
+/// 才能单测锁定。两条分支的取舍是刻意的：
+/// - `kind` 非空 ⇒ 驱动确实声明过通用类别，结构化透出（`Some`），REST 按类别映射；
+/// - `kind` 为空 ⇒ 驱动 `ok=false` 却没附 detail（对端违约）或旧路径没带类别，
+///   此时**不猜**类别（不回落 `Internal`），交回 REST 的旧码白名单，
+///   保证既有接口状态码逐字不变。
+fn descriptor_error_from_driver(kind: &str, code: String, message: String) -> DescriptorError {
+    if kind.is_empty() {
+        DescriptorError::new(code, message)
+    } else {
+        DescriptorError::with_kind(code, kind_from_wire(kind), message)
     }
 }
 
@@ -1355,10 +1403,16 @@ impl MesaManager {
                 // 驱动给出的结构化错误码原样上抛（`UNKNOWN_PARENT` 这类码必须
                 // 一路到达 REST，让调用方能区分"父节点写错"与"驱动不可用"）；
                 // 只有会话级失败（超时/断开/协议）才归为 `BROWSE_FAILED`。
+                //
+                // `kind` 必须一起带出：驱动声明的是**通用类别**（配置/连接/超时/
+                // 地址/不支持/…），REST 只有拿到它才能把"连不上设备"映射成 503、
+                // "探测超时"映射成 504，而不是把它们和"父节点写错"一起压成 400。
                 .map_err(|e| match e {
-                    SessionError::Driver { code, message, .. } => {
-                        DescriptorError::new(code, message)
-                    }
+                    SessionError::Driver {
+                        kind,
+                        code,
+                        message,
+                    } => descriptor_error_from_driver(&kind, code, message),
                     other => DescriptorError::new("BROWSE_FAILED", format!("{other}")),
                 });
             let res = match browsed {
@@ -1870,6 +1924,57 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::Configuration);
         assert_eq!(e.code, "UNSUPPORTED_DEFINITION_REVISION");
         assert!(e.message.contains("available"));
+    }
+
+    /// Browse 错误过 Manager 边界的契约：**驱动声明的通用类别必须结构化透出**。
+    ///
+    /// 缺陷现场：`SessionError::Driver { code, message, .. }` 的 `..` 把 kind 丢了，
+    /// 于是"父节点写错"（配置类）与"连不上设备"（连接类）、"远端超时"（超时类）
+    /// 在 REST 侧完全无法区分，一律落到 400。本用例把四条分支钉死：
+    /// 驱动声明 ⇒ `Some(类别)`；空 kind ⇒ `None`（不猜）；九种类别全覆盖；
+    /// 既有构造点走 `new` ⇒ 恒 `None`（行为零变化）。
+    #[test]
+    fn browse_error_preserves_driver_declared_kind() {
+        use mesa_core_types::ErrorKind as K;
+
+        // ① 驱动声明的类别逐字过线，code/message 不改写（REST 原样进错误信封）。
+        let e = descriptor_error_from_driver(
+            "ConnectionError",
+            "CONNECT_FAILED".into(),
+            "connect refused".into(),
+        );
+        assert_eq!(e.kind, Some(K::Connection));
+        assert_eq!(e.code, "CONNECT_FAILED");
+        assert_eq!(e.message, "connect refused");
+
+        // ② 九种通用类别都能被识别（wire 字符串 ↔ 变体一一对应）。
+        let cases = [
+            ("ConfigurationError", K::Configuration),
+            ("ConnectionError", K::Connection),
+            ("Timeout", K::Timeout),
+            ("AddressError", K::Address),
+            ("ProtocolError", K::Protocol),
+            ("DecodeError", K::Decode),
+            ("DeviceError", K::Device),
+            ("Unsupported", K::Unsupported),
+            ("InternalError", K::Internal),
+        ];
+        for (wire, want) in cases {
+            let e = descriptor_error_from_driver(wire, "C".into(), "m".into());
+            assert_eq!(e.kind, Some(want), "wire `{wire}` 必须映射为 {want:?}");
+        }
+
+        // ③ 空 kind = 驱动没声明类别（ok=false 却无 detail）⇒ 不猜成 Internal，
+        //    回落旧码白名单，保证升级不悄悄改变已发布接口的状态码。
+        let e = descriptor_error_from_driver("", "BROWSE_FAILED".into(), "peer 违约".into());
+        assert_eq!(e.kind, None, "空 kind 不得被猜成 Internal");
+
+        // ④ 既有构造点（Descriptor 获取 / OpenConnection / 会话级失败等）走 `new`，
+        //    kind 恒为 None —— 这是"25 处调用点未被迫改动"的机械证据。
+        let legacy = DescriptorError::new("DRIVER_UNAVAILABLE", "x");
+        assert_eq!(legacy.kind, None);
+        assert_eq!(legacy.code, "DRIVER_UNAVAILABLE");
+        assert_eq!(legacy.message, "x");
     }
 
     /// E4 与 E4-b **互不替代**：格式错报 `DEFINITION_RESPONSE_INVALID`，
