@@ -458,8 +458,8 @@ impl DefinitionCatalog {
         };
         let mut family_seen: Option<String> = None;
         for raw in definition_docs {
-            let doc: DefinitionDoc = serde_json::from_str(raw)
-                .map_err(|e| CatalogError::Json(e.to_string()))?;
+            let doc: DefinitionDoc =
+                serde_json::from_str(raw).map_err(|e| CatalogError::Json(e.to_string()))?;
             if doc.format_version != DEFINITION_FORMAT_VERSION {
                 return Err(CatalogError::UnsupportedFormatVersion(doc.format_version));
             }
