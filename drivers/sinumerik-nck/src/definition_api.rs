@@ -28,7 +28,6 @@ use mesa_core_types::ErrorKind;
 use serde_json::{Map, Value};
 
 use crate::catalog_category::classify_category;
-use crate::definition::DefinitionCategory;
 use crate::compiler::{AddressCompiler, CompileError};
 use crate::definition::{
     CatalogError, DEFINITION_FORMAT_VERSION, DefinitionCatalog, DefinitionScope,
@@ -261,8 +260,8 @@ where
     // （`definition.rs:422-428`），故取任一条即文件级值；空目录回落到最小合法值。
     let file_revision = catalog
         .iter()
-        .next()
         .map(|d| d.revision)
+        .max()
         .unwrap_or(MIN_DEFINITION_REVISION);
 
     let mut out = Map::new();
