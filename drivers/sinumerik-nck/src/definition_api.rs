@@ -41,7 +41,14 @@ pub const DEFAULT_LIMIT: u32 = 100;
 pub const MAX_LIMIT: u32 = 500;
 
 /// 目录查询参数允许的键（DC §4.1 的五个参数）。
-const QUERY_KEYS: [&str; 6] = ["family", "variable_id", "revision", "limit", "cursor", "include_history"];
+const QUERY_KEYS: [&str; 6] = [
+    "family",
+    "variable_id",
+    "revision",
+    "limit",
+    "cursor",
+    "include_history",
+];
 
 /// 预览请求信封允许的键（DC §5.1：只有这三个；`point_key` 正是要被算出来的东西）。
 const PREVIEW_KEYS: [&str; 3] = ["family", "kind", "parameters"];
@@ -507,23 +514,11 @@ fn select_definitions<'a>(
     query: &CatalogQuery,
 ) -> Result<(Vec<&'a VariableDefinition>, Option<String>), DefinitionApiError> {
     if let Some(variable_id) = &query.variable_id {
-        // 指定 revision 时精确读取历史版本；省略 revision 时只取该变量最新版本。
-        let def = if let Some(revision) = query.revision {
-            catalog
-                .lookup(variable_id, revision)
-                .map_err(DefinitionApiError::from_compile)?
-        } else {
-            catalog
-                .iter()
-                .find(|d| &d.variable_id == variable_id)
-                .ok_or_else(|| {
-                    DefinitionApiError::new(
-                        ErrorKind::Address,
-                        "UNKNOWN_VARIABLE",
-                        format!("变量 `{variable_id}` 没有已发布定义"),
-                    )
-                })?
-        };
+        // 精确变量查询必须同时提供 revision；解析器拒绝缺省回落，保证历史点位不会被静默升级。
+        let revision = query.revision.expect("parse_catalog_query enforces variable_id/revision pairing");
+        let def = catalog
+            .lookup(variable_id, revision)
+            .map_err(DefinitionApiError::from_compile)?;
         if let Some(f) = &query.family
             && &def.family != f
         {
@@ -542,11 +537,13 @@ fn select_definitions<'a>(
     // 普通目录默认只列每个 variable_id 的最新版本，保持用户树不重复。
     // include_history=true 仅供客户端建立 byRevision 索引、核验已有点位使用。
     let defs: Vec<&VariableDefinition> = if query.include_history {
-        catalog.iter_all()
+        catalog
+            .iter_all()
             .filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f))
             .collect()
     } else {
-        catalog.iter()
+        catalog
+            .iter()
             .filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f))
             .collect()
     };
