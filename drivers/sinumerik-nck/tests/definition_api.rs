@@ -381,7 +381,6 @@ async fn definitions_payload_is_verbatim_projection() {
     }
 }
 
-
 /// Revision 1 remains addressable exactly, while unqualified catalog queries expose revision 2.
 #[tokio::test]
 async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_available() {
@@ -418,7 +417,6 @@ async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_availab
     assert_eq!(old["category_basis"], "navigation_rule");
     assert_eq!(old["semantics_status"], "verified");
 }
-
 
 #[tokio::test]
 async fn include_history_returns_all_84_published_revisions_for_editing() {
