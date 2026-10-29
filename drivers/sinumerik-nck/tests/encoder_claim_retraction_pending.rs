@@ -6,11 +6,8 @@ const R1_JSON: &str = include_str!("../definitions/828d/r1.json");
 const R2_JSON: &str = include_str!("../definitions/828d/r2.json");
 const CITED_EVIDENCE_FILE: &str = "docs/evidence/nck-live-identity-probe.txt";
 
-fn find_definition<'a>(json: &'a str, id: &str) -> &'a Value {
-    let value: &'a Value = Box::leak(Box::new(
-        serde_json::from_str(json).expect("definition JSON must be valid"),
-    ));
-    value["definitions"]
+fn find_definition<'a>(catalog: &'a Value, id: &str) -> &'a Value {
+    catalog["definitions"]
         .as_array()
         .expect("definitions array")
         .iter()
@@ -20,7 +17,8 @@ fn find_definition<'a>(json: &'a str, id: &str) -> &'a Value {
 
 #[test]
 fn revision_one_remains_immutable_historical_evidence() {
-    let def = find_definition(R1_JSON, "axis.encoder.module_number");
+    let catalog: Value = serde_json::from_str(R1_JSON).expect("r1.json must be valid");
+    let def = find_definition(&catalog, "axis.encoder.module_number");
     assert_eq!(def["revision"], 1);
     assert_eq!(def["semantics_status"], "verified");
     assert!(def["source"].as_array().unwrap().iter().any(|s| {
@@ -30,7 +28,8 @@ fn revision_one_remains_immutable_historical_evidence() {
 
 #[test]
 fn current_revision_removes_unsupported_measurement_claim() {
-    let def = find_definition(R2_JSON, "axis.encoder.module_number");
+    let catalog: Value = serde_json::from_str(R2_JSON).expect("r2.json must be valid");
+    let def = find_definition(&catalog, "axis.encoder.module_number");
     assert_eq!(def["revision"], 2);
     assert_eq!(def["semantics_status"], "candidate");
     assert_eq!(def["category"], "machine_data");
