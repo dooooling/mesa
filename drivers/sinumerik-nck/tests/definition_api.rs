@@ -373,8 +373,9 @@ async fn definitions_payload_is_verbatim_projection() {
 /// Revision 1 remains addressable exactly, while unqualified catalog queries expose revision 2.
 #[tokio::test]
 async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_available() {
-    let latest = catalog_json(json!({ "variable_id": "axis.encoder.module_number" })).await;
-    let row = latest["definitions"].as_array().unwrap().first().unwrap();
+    let latest = catalog_json(json!({})).await;
+    let row = latest["definitions"].as_array().unwrap().iter()
+        .find(|d| d["variable_id"] == "axis.encoder.module_number").unwrap();
     assert_eq!(row["revision"], 2);
     assert_eq!(row["category"], "machine_data");
     assert_eq!(row["category_basis"], "definition");
@@ -391,6 +392,19 @@ async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_availab
     assert_eq!(old["revision"], 1);
     assert_eq!(old["category_basis"], "navigation_rule");
     assert_eq!(old["semantics_status"], "verified");
+}
+
+
+#[tokio::test]
+async fn include_history_returns_all_84_published_revisions_for_editing() {
+    let all = catalog_json(json!({ "include_history": true, "limit": 500 })).await;
+    assert_eq!(all["total"], 84);
+    let rows = all["definitions"].as_array().unwrap();
+    assert_eq!(rows.len(), 84);
+    let r1 = rows.iter().find(|d| d["variable_id"] == "axis.encoder.module_number" && d["revision"] == 1).unwrap();
+    let r2 = rows.iter().find(|d| d["variable_id"] == "axis.encoder.module_number" && d["revision"] == 2).unwrap();
+    assert_eq!(r1["category_basis"], "navigation_rule");
+    assert_eq!(r2["category_basis"], "definition");
 }
 
 /// I3：26/130 的入口区别由 `golden_ref[].entry` 保留，且**不暴露原始 Module 数字**。
