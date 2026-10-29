@@ -649,7 +649,7 @@ export function EndpointAcquisitionPane({
     setCatalogState("loading");
     setCatalogError("");
     setCatalog(null);
-    fetchNckCatalog({ driverId })
+    fetchNckCatalog({ driverId, includeHistory: true })
       .then((loaded) => {
         if (cancelled) return;
         setCatalog(loaded);
