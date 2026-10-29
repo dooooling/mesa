@@ -1296,23 +1296,17 @@ python audit_sources.py drivers/sinumerik-nck/definitions/828d/r1.json audit.jso
 `docs/evidence/nck-native-address-evidence.json` 的 `unresolved: string-lengths` 保持 open，
 本轮只补边界测试（`drivers/sinumerik-nck/src/value.rs:358`、`lib.rs:1223`），不补"权威依据"。
 
-### 7.3 `axis.encoder.module_number`：measurement 声明标记为 `retraction_pending_definition_rev`
+### 7.3 `axis.encoder.module_number`：revision 2 已修正，revision 1 保留历史
 
-> **生效定义仍携带该声明**：`r1.json` 中 `axis.encoder.module_number` 仍为 `revision=1`、`semantics_status=verified`，且 `source[]` 仍含指向 `docs/evidence/nck-live-identity-probe.txt` 的 `measurement` 条目。本 PR **未移除**它——定义目录的 `(variable_id, revision)` 不可原地修改，且当前不存在撤回机制，移除须发布新 revision 或经评审的定义修订。**审计判定不等于定义已撤回。**
+PR #151 之后，生效的 revision 1 仍携带一条无证据的 `measurement` 来源；不能把当时的审计记录说成已撤回。
 
+本轮方案 B 已发布 revision 2：
+- `source[]` 移除了指向 `docs/evidence/nck-live-identity-probe.txt` 的无依据 `measurement`；
+- `semantics_status` 从 `verified` 降为 `candidate`；
+- `category` 作为正式字段写入定义并参与 digest；
+- revision 1 与其 digest 保持不变，供历史精确查找，不代表当前证据状态。
 
-| 项 | 内容 |
-|---|---|
-| 定义 | `r1.json:1199`（`scope=identity`、`semantics_status=verified`、`column=30220`、`module=26`、`decode=U8`、`transport_size=9`） |
-| 被撤的 source 条目 | `r1.json:1207` — `{ "kind": "measurement", "reference": "docs/evidence/nck-live-identity-probe.txt" }` |
-| **标记** | **`retraction_pending_definition_rev`** |
-| 撤的依据 ① | 所引证据文件共 128 行 / 13 个小节（小节头在第 7、16、25、34、43、52、61、70、79、88、97、106、115 行），**没有「编码器驱动号」一节** |
-| 撤的依据 ② | 产生该文件的探针 `drivers/sinumerik-nck/tests/live_identity_probe.rs:16-20` 的 use 清单**不含** `AXIS_ENC_MODULE_NR`，探针体也不调用它 ⇒ 该文件不可能含此读数 |
-| 撤的依据 ③ | 常量 `AXIS_ENC_MODULE_NR`（`identity_spec.rs:155`）**不在任何执行路径上**：`drivers/sinumerik-nck/src/identity.rs:6-9` 的导入清单不含它，`identity.rs:152-193` 的轴身份读取序列没有它。它只被 `PROBES_828D`（`identity_spec.rs:233`）列出、被 `tests/definition_catalog.rs:404` 逐字段比对 |
-| 仍然成立的证据 | `identity_probe`（常量 + 目录契约测试）、`frozen_vector`（`A/M/MDCA_ENC_MODULE_NR`）、07/2023 机床数据手册 p365/p366 的 MD30220 文档依据（较早版本，仅文档级；索引页 p665 自证页码） |
-| 不能声称的事项 | 真机实测；native module 字节 26 对该机床数据的适用性；`line=1` 对应编码器下标 0 或 1（MD30220 按编码器编号 0/1 索引，见 p366） |
-| 对 `r1.json` 的影响 | **无**（本轮硬约束）。该 source 条目的实际移除须经评审的定义修订；代码侧以 FIXME/TODO 标注（`identity_spec.rs:136`、`:147`） |
-
+**当前状态：声明已在最新 revision 修正；原生 module / area_no / line 映射仍 unresolved，且未做本轮真机验证。**
 ### 7.4 《SINAMICS S120/S150 参数手册 11/2023》：登记为 `pending_document`
 
 | 项 | 内容 |
