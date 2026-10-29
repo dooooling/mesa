@@ -432,9 +432,11 @@ fn parse_catalog_query(request_json: &str) -> Result<CatalogQuery, DefinitionApi
     let include_history = match obj.get("include_history") {
         None => false,
         Some(Value::Bool(value)) => *value,
-        Some(other) => return Err(DefinitionApiError::invalid_query(format!(
-            "`include_history` 必须是布尔值，实际 {other}"
-        ))),
+        Some(other) => {
+            return Err(DefinitionApiError::invalid_query(format!(
+                "`include_history` 必须是布尔值，实际 {other}"
+            )));
+        }
     };
 
     // revision 与 variable_id 必须成对：只给 revision 等于「全目录过滤 revision」，
@@ -515,7 +517,9 @@ fn select_definitions<'a>(
 ) -> Result<(Vec<&'a VariableDefinition>, Option<String>), DefinitionApiError> {
     if let Some(variable_id) = &query.variable_id {
         // 精确变量查询必须同时提供 revision；解析器拒绝缺省回落，保证历史点位不会被静默升级。
-        let revision = query.revision.expect("parse_catalog_query enforces variable_id/revision pairing");
+        let revision = query
+            .revision
+            .expect("parse_catalog_query enforces variable_id/revision pairing");
         let def = catalog
             .lookup(variable_id, revision)
             .map_err(DefinitionApiError::from_compile)?;
