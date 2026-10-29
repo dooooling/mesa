@@ -22,7 +22,7 @@
 //! （PR-B3：拒绝点在 `NckConnection::configure`，不在目录/预览）。少 6 条 +
 //! 浏览树仍 62 叶会形成两份真值，是被明令禁止的组合（DC §9.3-C′）。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use mesa_core_types::ErrorKind;
 use serde_json::{Map, Value};

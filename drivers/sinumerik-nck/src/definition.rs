@@ -473,6 +473,12 @@ impl DefinitionCatalog {
             } else {
                 family_seen = Some(doc.family.clone());
             }
+            if !lock.family.is_empty() && lock.family != doc.family {
+                return Err(CatalogError::LockJson(format!(
+                    "Lock family `{}` 与定义 family `{}` 不一致",
+                    lock.family, doc.family
+                )));
+            }
             for def in doc.definitions {
                 if def.family != doc.family {
                     return Err(CatalogError::InvalidDefinition {
