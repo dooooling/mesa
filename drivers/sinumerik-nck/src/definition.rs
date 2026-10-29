@@ -563,14 +563,20 @@ impl DefinitionCatalog {
         self.iter().filter(|d| d.family == family).collect()
     }
 
-    /// 全部定义的稳定遍历。
+    /// 每个 variable_id 的最新已发布定义（用户目录 / 默认选择使用此视图）。
+    /// 历史 revision 仍保留在目录中，可通过 lookup(id, revision) 精确读取。
     pub fn iter(&self) -> impl Iterator<Item = &VariableDefinition> {
+        self.by_id.values().filter_map(|revisions| revisions.last_key_value().map(|(_, d)| d))
+    }
+
+    /// 所有已发布 revision 的稳定遍历（摘要锁核验、历史审计使用）。
+    pub fn iter_all(&self) -> impl Iterator<Item = &VariableDefinition> {
         self.by_id.values().flat_map(|m| m.values())
     }
 
-    /// 定义总数。
+    /// 当前目录中不同 variable_id 的数量（不把历史 revision 重复计为新变量）。
     pub fn len(&self) -> usize {
-        self.by_id.values().map(|m| m.len()).sum()
+        self.by_id.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -591,7 +597,7 @@ impl DefinitionCatalog {
     /// 重算全部已发布摘要并与 `DIGESTS.lock` 比对（§3.2 / 矩阵 #10）。
     pub fn verify_digests(&self) -> Result<(), CatalogError> {
         let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
-        for def in self.iter() {
+        for def in self.iter_all() {
             let key = (def.variable_id.clone(), def.revision);
             seen.insert(key.clone());
             let actual =
