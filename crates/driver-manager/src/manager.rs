@@ -12,6 +12,7 @@ use crate::endpoint::{
     BuiltinEndpoint, PointIdAllocator, PointIdSource, run_endpoint_with_attempt,
 };
 use crate::manifest::{DiscoveredDriver, scan_drivers};
+use crate::session::SessionError;
 use crate::snapshot::{DriverInfo, Snapshot};
 
 /// Descriptor 缓存键（§4.5）：(driver_id, driver_version)
@@ -1351,7 +1352,15 @@ impl MesaManager {
             let browsed = session
                 .browse(handle, parent, filter, cursor, limit)
                 .await
-                .map_err(|e| DescriptorError::new("BROWSE_FAILED", format!("{e}")));
+                // 驱动给出的结构化错误码原样上抛（`UNKNOWN_PARENT` 这类码必须
+                // 一路到达 REST，让调用方能区分"父节点写错"与"驱动不可用"）；
+                // 只有会话级失败（超时/断开/协议）才归为 `BROWSE_FAILED`。
+                .map_err(|e| match e {
+                    SessionError::Driver { code, message, .. } => {
+                        DescriptorError::new(code, message)
+                    }
+                    other => DescriptorError::new("BROWSE_FAILED", format!("{other}")),
+                });
             let res = match browsed {
                 Ok(v) => v,
                 Err(e) => return (td, Err(e)),

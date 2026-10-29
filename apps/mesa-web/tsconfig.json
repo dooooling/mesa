@@ -7,6 +7,9 @@
     "skipLibCheck": true,
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
+    // 流程测试直接消费**驱动产出的** Browse 契约夹具（JSON）：树 id 与节点形状
+    // 必须来自驱动，不能在测试里手写（历史教训见 objectProbeFlow.test.tsx 头部）。
+    "resolveJsonModule": true,
     "isolatedModules": true,
     "moduleDetection": "force",
     "noEmit": true,

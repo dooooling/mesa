@@ -3,6 +3,8 @@
 //!
 //! 身份探针是**驱动内建诊断程序**（`identity_spec`），不查变量目录、
 //! 不依赖模板文件存在，也不构成“允许采集哪些地址”的白名单。
+use crate::browse_selection::CODE_UNKNOWN_PARENT;
+use crate::identity_instances::{CHANNELS, SPINDLES, channels_page, spindles_page};
 use crate::identity_spec::{
     AXIS_CTRLOUT_MODULE_NR, AXIS_CTRLOUT_TYPE, AXIS_NAME, AXIS_SPIND_ASSIGN, DRIVE_OBJECT_NAME,
     DRIVE_OBJECT_NAME_M130, IdentityProbeSpec, probes_for_family,
@@ -10,13 +12,13 @@ use crate::identity_spec::{
 use crate::presets::{PresetRegistry, leaf_node_with};
 use crate::{NckClient, NckConnConfig, decode_value};
 use mesa_core_types::{ErrorKind, Value};
-use mesa_driver_protocol::pb::BrowseNode;
+use mesa_driver_protocol::pb::{BrowseDiagnosticSeverity, BrowseNode};
 use mesa_driver_sdk::SdkDriverError;
 
 pub const ROOT: &str = "nck://identity";
 const AXES: &str = "nck://identity/axes";
 const OBJECTS: &str = "nck://identity/objects";
-const MAX_INSTANCE: u16 = 31;
+pub(crate) const MAX_INSTANCE: u16 = 31;
 
 /// 身份实例页的**驱动侧**上限（不依赖调用方传对 `limit`）。
 ///
@@ -25,8 +27,8 @@ const MAX_INSTANCE: u16 = 31;
 /// 在 15 秒预算内顺序读约 `31 × 5` 项——分页等于没有生效。这里把每页钉在
 /// 个位数，使单次请求的读取量可观测、有上界；后续页由 `next_cursor` 驱动
 /// （Web 已有「下一页」入口）。
-const IDENTITY_PAGE_MAX: usize = 8;
-type Page = (Vec<BrowseNode>, Option<String>);
+pub(crate) const IDENTITY_PAGE_MAX: usize = 8;
+pub(crate) type Page = (Vec<BrowseNode>, Option<String>);
 
 struct AxisIdentity {
     index: u16,
@@ -44,7 +46,7 @@ pub fn supported(family: &str) -> bool {
 }
 
 /// 分支节点：**明确不可选**（IPC 1.8 选择契约），前端无需靠空信封形态猜测。
-fn folder(id: &str, label: &str) -> BrowseNode {
+pub(crate) fn folder(id: &str, label: &str) -> BrowseNode {
     let selection = mesa_driver_protocol::browse_selection::not_selectable();
     BrowseNode {
         id: id.into(),
@@ -82,15 +84,48 @@ fn diagnostic(id: &str, message: String) -> BrowseNode {
     }
 }
 
-fn device_rejected(error: &SdkDriverError) -> bool {
+pub(crate) fn device_rejected(error: &SdkDriverError) -> bool {
     error.code.starts_with("S7_JOB_") || error.code.starts_with("S7_ITEM_")
+}
+
+/// 诊断节点（**带结构化诊断**）：不可选，但必须让机器识别出结论类型。
+///
+/// 与 [`diagnostic`] 的分工：
+/// - [`diagnostic`] 把理由写进 `label`，用于"这条路径本身不该被选用"（轴/对象被拒绝）；
+/// - 本函数把理由放进 `diagnostics[]`（稳定码 + 文案 + 级别），用于"读不到 /
+///   无法判定 / 集合可能不完整"这类**结论**——前端据此区分"不存在"与"没读到"，
+///   只写在标签里就又要回到解析文案的老路。
+///
+/// 级别一律由调用方给：这里的节点本身不可选，诊断是说明而不是准入裁决，
+/// 因此默认用 WARNING（可见但不制造红色阻断）。
+pub(crate) fn note(
+    id: String,
+    code: &str,
+    message: String,
+    severity: BrowseDiagnosticSeverity,
+) -> BrowseNode {
+    let selection = mesa_driver_protocol::browse_selection::not_selectable();
+    BrowseNode {
+        id,
+        label: message.clone(),
+        kind: "diagnostic".into(),
+        data_type: String::new(),
+        access: "read".into(),
+        has_children: false,
+        binding_json: "{}".into(),
+        selection_mode: selection.mode as i32,
+        selection_payload_json: selection.payload_json,
+        diagnostics: vec![mesa_driver_protocol::browse_selection::diagnostic(
+            code, message, severity,
+        )],
+    }
 }
 
 /// 只有成功解码的空名称代表表尾；作业/单项拒绝与本地解码失败均保留为错误。
 ///
 /// `target` 填入探针的可变槽位（`ProbeSlot::TargetIndex`）；探针是内建常量，
 /// 不查目录、不依赖模板。
-async fn read(
+pub(crate) async fn read(
     client: &mut NckClient,
     spec: &IdentityProbeSpec,
     target: u16,
@@ -138,7 +173,7 @@ fn as_string(value: Value) -> Result<String, SdkDriverError> {
     }
 }
 
-fn as_u32(value: Value) -> Result<u32, SdkDriverError> {
+pub(crate) fn as_u32(value: Value) -> Result<u32, SdkDriverError> {
     match value {
         Value::U32(number) => Ok(number),
         _ => Err(SdkDriverError::new(
@@ -266,14 +301,14 @@ fn variable_nodes(
         .collect()
 }
 
-fn matches(node: &BrowseNode, filter: &str) -> bool {
+pub(crate) fn matches(node: &BrowseNode, filter: &str) -> bool {
     node.kind == "diagnostic"
         || filter.is_empty()
         || node.label.contains(filter)
         || node.id.contains(filter)
 }
 
-fn limit_size(limit: u32) -> usize {
+pub(crate) fn limit_size(limit: u32) -> usize {
     if limit == 0 {
         50
     } else {
@@ -281,7 +316,7 @@ fn limit_size(limit: u32) -> usize {
     }
 }
 
-fn local_page(
+pub(crate) fn local_page(
     mut nodes: Vec<BrowseNode>,
     filter: &str,
     cursor: &str,
@@ -303,7 +338,7 @@ fn local_page(
     ))
 }
 
-fn instance_cursor(cursor: &str) -> Result<u16, SdkDriverError> {
+pub(crate) fn instance_cursor(cursor: &str) -> Result<u16, SdkDriverError> {
     let index = if cursor.is_empty() {
         1
     } else {
@@ -383,6 +418,8 @@ async fn instance_page(
 enum Target {
     Axes,
     Objects,
+    Channels,
+    Spindles,
     Axis(u16),
     Object(u16),
 }
@@ -393,6 +430,12 @@ fn target(parent: &str) -> Result<Option<Target>, SdkDriverError> {
     }
     if parent == OBJECTS {
         return Ok(Some(Target::Objects));
+    }
+    if parent == CHANNELS {
+        return Ok(Some(Target::Channels));
+    }
+    if parent == SPINDLES {
+        return Ok(Some(Target::Spindles));
     }
     for (prefix, is_axis) in [
         ("nck://identity/axis/", true),
@@ -417,6 +460,9 @@ fn target(parent: &str) -> Result<Option<Target>, SdkDriverError> {
 }
 
 /// 单次请求仅读取目标页或选中身份；不遍历另一入口，不推断两个入口编号相同。
+///
+/// 根（`nck://identity`）下四个分支互不代偿：轴/驱动对象回答"这台机床有哪些轴与
+/// 驱动对象"，通道/主轴回答"有哪些通道与主轴"，读法完全不同，因此各自成页。
 pub async fn browse(
     cfg: &NckConnConfig,
     presets: &PresetRegistry,
@@ -429,6 +475,8 @@ pub async fn browse(
         return local_page(
             vec![
                 folder(AXES, "机床轴（NC驱动入口）"),
+                folder(CHANNELS, "通道（按通道号实时核对）"),
+                folder(SPINDLES, "主轴（按轴分配实时派生）"),
                 folder(OBJECTS, "驱动对象（候选入口，按名称核对）"),
             ],
             filter,
@@ -437,15 +485,29 @@ pub async fn browse(
         );
     }
     let Some(target) = target(parent)? else {
-        return Ok((Vec::new(), None));
+        // 未知父节点必须报错：静默返回空页会让"树 id 写错/树不存在"与
+        // "设备上确实没有对象"长得一模一样（本轮纠正的老行为）。
+        return Err(SdkDriverError::configuration(
+            CODE_UNKNOWN_PARENT,
+            format!("未知的浏览父节点 `{parent}`：只接受根（空 parent）或驱动列出的节点 id"),
+        ));
     };
-    if matches!(target, Target::Axes | Target::Objects) {
+    if matches!(target, Target::Axes | Target::Objects | Target::Channels) {
         instance_cursor(cursor)?;
+    }
+    if matches!(target, Target::Spindles) && !cursor.is_empty() {
+        // 主轴页的游标是**结果偏移**（本地分页），与实例游标（1..=31）语义不同，
+        // 因此单独校验；非法游标必须在建连**之前**失败（不得先碰控制器）。
+        cursor.parse::<usize>().map_err(|_| {
+            SdkDriverError::configuration("IDENTITY_CURSOR", "主轴页游标必须是非负整数")
+        })?;
     }
     let mut client = NckClient::connect(cfg).await?;
     match target {
         Target::Axes => instance_page(&mut client, true, filter, cursor, limit).await,
         Target::Objects => instance_page(&mut client, false, filter, cursor, limit).await,
+        Target::Channels => channels_page(&mut client, &cfg.family, filter, cursor, limit).await,
+        Target::Spindles => spindles_page(&mut client, &cfg.family, filter, cursor, limit).await,
         Target::Axis(index) => match axis(&mut client, index).await {
             Ok(Some(axis)) => {
                 // 身份复核被拒绝后不存在可翻页的变量列表；旧游标不能跳过诊断。

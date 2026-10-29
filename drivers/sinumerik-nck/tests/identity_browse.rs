@@ -82,12 +82,27 @@ fn reset_reads(fixture: &NckFixture) {
 #[tokio::test]
 async fn fresh_requests_browse_root_pages_axis_object_and_leaf_pages_without_full_rescan() {
     let fixture = NckFixture::spawn(recorded_state()).await;
-    let (root, next) = connection(&fixture).browse(ROOT, "", "", 1).await.unwrap();
-    assert_eq!(root[0].id, AXES);
-    assert_eq!(next.as_deref(), Some("1"));
-    let (root, next) = connection(&fixture).browse(ROOT, "", "1", 1).await.unwrap();
-    assert_eq!(root[0].id, OBJECTS);
-    assert!(next.is_none());
+    // 身份根下四棵树（轴 / 通道 / 主轴 / 驱动对象），逐页翻完：分页语义是
+    // "游标 = 下一个分支下标"，因此四页各一项，最后一页没有后续游标。
+    for (cursor, expected) in [
+        ("", AXES),
+        ("1", "nck://identity/channels"),
+        ("2", "nck://identity/spindles"),
+        ("3", OBJECTS),
+    ] {
+        let (root, next) = connection(&fixture)
+            .browse(ROOT, "", cursor, 1)
+            .await
+            .unwrap();
+        assert_eq!(root.len(), 1, "游标 `{cursor}` 只返回一项");
+        assert_eq!(root[0].id, expected, "游标 `{cursor}`");
+        let expected_next = if expected == OBJECTS {
+            None
+        } else {
+            Some((cursor.parse::<usize>().unwrap_or(0) + 1).to_string())
+        };
+        assert_eq!(next, expected_next, "游标 `{cursor}` 的后续游标");
+    }
     assert!(
         fixture.received_specs().is_empty(),
         "根目录和翻页不能访问控制器"

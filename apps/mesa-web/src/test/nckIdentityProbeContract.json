@@ -1,0 +1,277 @@
+{
+  "family": "828d",
+  "note": "由 drivers/sinumerik-nck/tests/identity_probe_trees.rs 的 web_contract_fixture_matches_driver_browse_contract 产出：前端测试只消费，不得手改。",
+  "pages": {
+    "": {
+      "next_cursor": null,
+      "nodes": [
+        {
+          "access": "read",
+          "binding_json": "{}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": true,
+          "id": "nck://presets",
+          "kind": "folder",
+          "label": "常用预设模板（可选预填，需确认实例与行）",
+          "selection_mode": 3,
+          "selection_payload_json": ""
+        },
+        {
+          "access": "read",
+          "binding_json": "{}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": true,
+          "id": "nck://identity",
+          "kind": "folder",
+          "label": "轴与驱动对象（实时只读核对）",
+          "selection_mode": 3,
+          "selection_payload_json": ""
+        }
+      ]
+    },
+    "nck://identity": {
+      "next_cursor": null,
+      "nodes": [
+        {
+          "access": "read",
+          "binding_json": "{}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": true,
+          "id": "nck://identity/axes",
+          "kind": "folder",
+          "label": "机床轴（NC驱动入口）",
+          "selection_mode": 3,
+          "selection_payload_json": ""
+        },
+        {
+          "access": "read",
+          "binding_json": "{}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": true,
+          "id": "nck://identity/channels",
+          "kind": "folder",
+          "label": "通道（按通道号实时核对）",
+          "selection_mode": 3,
+          "selection_payload_json": ""
+        },
+        {
+          "access": "read",
+          "binding_json": "{}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": true,
+          "id": "nck://identity/spindles",
+          "kind": "folder",
+          "label": "主轴（按轴分配实时派生）",
+          "selection_mode": 3,
+          "selection_payload_json": ""
+        },
+        {
+          "access": "read",
+          "binding_json": "{}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": true,
+          "id": "nck://identity/objects",
+          "kind": "folder",
+          "label": "驱动对象（候选入口，按名称核对）",
+          "selection_mode": 3,
+          "selection_payload_json": ""
+        }
+      ]
+    },
+    "nck://identity/channels": {
+      "next_cursor": "9",
+      "nodes": [
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"channel.feed.actual\",\"channel.feed.commanded\",\"channel.feed.override\",\"channel.machine_axis_assignment\",\"channel.program.block\",\"channel.program.line_number\",\"channel.program.name.active\",\"channel.program.name.main\",\"channel.program.status\",\"channel.r_parameter\",\"channel.tool.number_active\",\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"channel\",\"required\":true}],\"preview_point_key\":null,\"template\":\"channel.feed.actual@channel={channel}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"channel\":1}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/channels/1",
+          "kind": "nck_variable",
+          "label": "通道1 · 位置1→机床轴1",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"channel.feed.actual\",\"channel.feed.commanded\",\"channel.feed.override\",\"channel.machine_axis_assignment\",\"channel.program.block\",\"channel.program.line_number\",\"channel.program.name.active\",\"channel.program.name.main\",\"channel.program.status\",\"channel.r_parameter\",\"channel.tool.number_active\",\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"channel\",\"required\":true}],\"preview_point_key\":null,\"template\":\"channel.feed.actual@channel={channel}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"channel\":1}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"channel.feed.actual\",\"channel.feed.commanded\",\"channel.feed.override\",\"channel.machine_axis_assignment\",\"channel.program.block\",\"channel.program.line_number\",\"channel.program.name.active\",\"channel.program.name.main\",\"channel.program.status\",\"channel.r_parameter\",\"channel.tool.number_active\",\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"channel\",\"required\":true}],\"preview_point_key\":null,\"template\":\"channel.feed.actual@channel={channel}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"channel\":2}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/channels/2",
+          "kind": "nck_variable",
+          "label": "通道2 · 位置1→机床轴2",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"axis.position.actual_bcs\",\"axis.position.commanded_mcs\",\"channel.feed.actual\",\"channel.feed.commanded\",\"channel.feed.override\",\"channel.machine_axis_assignment\",\"channel.program.block\",\"channel.program.line_number\",\"channel.program.name.active\",\"channel.program.name.main\",\"channel.program.status\",\"channel.r_parameter\",\"channel.tool.number_active\",\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"channel\",\"required\":true}],\"preview_point_key\":null,\"template\":\"channel.feed.actual@channel={channel}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"channel\":2}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{}",
+          "data_type": "",
+          "diagnostics": [
+            {
+              "code": "IDENTITY_PENDING_REVIEW",
+              "message": "通道3读到了数据但位置1未映射机床轴（值为0）：无法判定该通道是否可用，需人工复核",
+              "severity": 2
+            }
+          ],
+          "has_children": false,
+          "id": "nck://identity/channels/note/3",
+          "kind": "diagnostic",
+          "label": "通道3读到了数据但位置1未映射机床轴（值为0）：无法判定该通道是否可用，需人工复核",
+          "selection_mode": 3,
+          "selection_payload_json": ""
+        }
+      ]
+    },
+    "nck://identity/spindles": {
+      "next_cursor": null,
+      "nodes": [
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"spindle\",\"required\":true}],\"preview_point_key\":null,\"template\":\"spindle.speed.actual@channel={channel},spindle={spindle}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"spindle\":1}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/spindles/1",
+          "kind": "nck_variable",
+          "label": "主轴1 · 来源轴2/轴4",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"spindle\",\"required\":true}],\"preview_point_key\":null,\"template\":\"spindle.speed.actual@channel={channel},spindle={spindle}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"spindle\":1}}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"applies_to_variables\":[\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"spindle\",\"required\":true}],\"preview_point_key\":null,\"template\":\"spindle.speed.actual@channel={channel},spindle={spindle}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"spindle\":2}}}",
+          "data_type": "",
+          "diagnostics": [],
+          "has_children": false,
+          "id": "nck://identity/spindles/2",
+          "kind": "nck_variable",
+          "label": "主轴2 · 来源轴6",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"applies_to_variables\":[\"spindle.speed.actual\",\"spindle.speed.commanded\",\"spindle.speed.override\"],\"keys\":[{\"path\":\"spindle\",\"required\":true}],\"preview_point_key\":null,\"template\":\"spindle.speed.actual@channel={channel},spindle={spindle}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"target\":{\"spindle\":2}}}"
+        }
+      ]
+    },
+    "nck://presets": {
+      "next_cursor": "6",
+      "nodes": [
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.ctrlout.module_number\"}}",
+          "data_type": "",
+          "diagnostics": [
+            {
+              "code": "DEFINITION_SCOPE_NOT_COLLECTABLE",
+              "message": "定义 `axis.ctrlout.module_number` revision=1 的 scope=`identity` 不可采集（仅 scope=`collect` 允许进入采集计划）；请删除该点位，或改用 `nck_native` 显式声明原生地址",
+              "severity": 3
+            }
+          ],
+          "has_children": false,
+          "id": "nck://presets/828d.A.M.MDCA_CTRLOUT_MODULE_NR.nc_variable",
+          "kind": "nck_variable",
+          "label": "M/MDCA_CTRLOUT_MODULE_NR U8 · candidate · 待确认：area_no/line",
+          "selection_mode": 3,
+          "selection_payload_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.ctrlout.module_number\"}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.type@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.ctrlout.type\"}}",
+          "data_type": "",
+          "diagnostics": [
+            {
+              "code": "DEFINITION_SCOPE_NOT_COLLECTABLE",
+              "message": "定义 `axis.ctrlout.type` revision=1 的 scope=`identity` 不可采集（仅 scope=`collect` 允许进入采集计划）；请删除该点位，或改用 `nck_native` 显式声明原生地址",
+              "severity": 3
+            }
+          ],
+          "has_children": false,
+          "id": "nck://presets/828d.A.M.MDCA_CTRLOUT_TYPE.nc_variable",
+          "kind": "nck_variable",
+          "label": "M/MDCA_CTRLOUT_TYPE U8 · candidate · 待确认：area_no/line",
+          "selection_mode": 3,
+          "selection_payload_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.ctrlout.type@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.ctrlout.type\"}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.encoder.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.encoder.module_number\"}}",
+          "data_type": "",
+          "diagnostics": [
+            {
+              "code": "DEFINITION_SCOPE_NOT_COLLECTABLE",
+              "message": "定义 `axis.encoder.module_number` revision=1 的 scope=`identity` 不可采集（仅 scope=`collect` 允许进入采集计划）；请删除该点位，或改用 `nck_native` 显式声明原生地址",
+              "severity": 3
+            }
+          ],
+          "has_children": false,
+          "id": "nck://presets/828d.A.M.MDCA_ENC_MODULE_NR.nc_variable",
+          "kind": "nck_variable",
+          "label": "M/MDCA_ENC_MODULE_NR U8 · candidate · 待确认：area_no/line",
+          "selection_mode": 3,
+          "selection_payload_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.encoder.module_number@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.encoder.module_number\"}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.spindle_assignment@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.spindle_assignment\"}}",
+          "data_type": "",
+          "diagnostics": [
+            {
+              "code": "DEFINITION_SCOPE_NOT_COLLECTABLE",
+              "message": "定义 `axis.spindle_assignment` revision=1 的 scope=`identity` 不可采集（仅 scope=`collect` 允许进入采集计划）；请删除该点位，或改用 `nck_native` 显式声明原生地址",
+              "severity": 3
+            }
+          ],
+          "has_children": false,
+          "id": "nck://presets/828d.A.M.SPIND_ASSIGN_TO_MACHAX.nc_variable",
+          "kind": "nck_variable",
+          "label": "M/SPIND_ASSIGN_TO_MACHAX U8 · candidate · 待确认：area_no/line",
+          "selection_mode": 3,
+          "selection_payload_json": "{\"identity\":{\"keys\":[{\"path\":\"axis\",\"required\":true}],\"preview_point_key\":null,\"template\":\"axis.spindle_assignment@axis={axis}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"axis.spindle_assignment\"}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"keys\":[{\"path\":\"mode_group\",\"required\":true}],\"preview_point_key\":null,\"template\":\"mode_group.op_mode@mode_group={mode_group}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"mode_group.op_mode\"}}",
+          "data_type": "",
+          "diagnostics": [
+            {
+              "code": "IDENTITY_UNRESOLVED",
+              "message": "Browse 预览：身份未确定（target/arguments 不完整）——可选用后到语义表单补全，提交前必须由服务端 Preview 确认",
+              "severity": 2
+            }
+          ],
+          "has_children": false,
+          "id": "nck://presets/828d.B.S.opMode.nc_variable",
+          "kind": "nck_variable",
+          "label": "S/opMode U16_LE · candidate · 待确认：area_no/line",
+          "selection_mode": 2,
+          "selection_payload_json": "{\"identity\":{\"keys\":[{\"path\":\"mode_group\",\"required\":true}],\"preview_point_key\":null,\"template\":\"mode_group.op_mode@mode_group={mode_group}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"mode_group.op_mode\"}}"
+        },
+        {
+          "access": "read",
+          "binding_json": "{\"identity\":{\"keys\":[{\"path\":\"channel\",\"required\":true},{\"path\":\"position\",\"required\":true}],\"preview_point_key\":null,\"template\":\"channel.machine_axis_assignment#position={position}@channel={channel}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"channel.machine_axis_assignment\"}}",
+          "data_type": "",
+          "diagnostics": [
+            {
+              "code": "DEFINITION_SCOPE_NOT_COLLECTABLE",
+              "message": "定义 `channel.machine_axis_assignment` revision=1 的 scope=`identity` 不可采集（仅 scope=`collect` 允许进入采集计划）；请删除该点位，或改用 `nck_native` 显式声明原生地址",
+              "severity": 3
+            }
+          ],
+          "has_children": false,
+          "id": "nck://presets/828d.C.M.AXCONF_MACHAX_USED.nc_variable",
+          "kind": "nck_variable",
+          "label": "M/AXCONF_MACHAX_USED U8 · candidate · 待确认：area_no/line",
+          "selection_mode": 3,
+          "selection_payload_json": "{\"identity\":{\"keys\":[{\"path\":\"channel\",\"required\":true},{\"path\":\"position\",\"required\":true}],\"preview_point_key\":null,\"template\":\"channel.machine_axis_assignment#position={position}@channel={channel}\"},\"kind\":\"nck_variable\",\"parameters\":{\"arguments\":{},\"definition_revision\":1,\"target\":{},\"variable_id\":\"channel.machine_axis_assignment\"}}"
+        }
+      ]
+    }
+  }
+}
