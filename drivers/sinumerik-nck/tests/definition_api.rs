@@ -57,43 +57,6 @@ fn read_repo_file(rel: &str) -> String {
 }
 
 /// `r1.json` 的原始定义（**逐字投影**的比对基准；只读，绝不改写）。
-fn raw_definitions() -> BTreeMap<String, Value> {
-    let doc: Value = serde_json::from_str(&read_repo_file(
-        "drivers/sinumerik-nck/definitions/828d/r1.json",
-    ))
-    .expect("r1.json 必须是合法 JSON");
-    doc["definitions"]
-        .as_array()
-        .expect("r1.json 必须含 definitions 数组")
-        .iter()
-        .map(|d| {
-            (
-                d["variable_id"].as_str().expect("variable_id").to_string(),
-                d.clone(),
-            )
-        })
-        .collect()
-}
-
-/// `DIGESTS.lock` 的已发布摘要（**唯一权威摘要来源**）。
-fn lock_digests() -> BTreeMap<String, String> {
-    let doc: Value = serde_json::from_str(&read_repo_file(
-        "drivers/sinumerik-nck/definitions/828d/DIGESTS.lock",
-    ))
-    .expect("DIGESTS.lock 必须是合法 JSON");
-    doc["entries"]
-        .as_array()
-        .expect("DIGESTS.lock 必须含 entries 数组")
-        .iter()
-        .map(|e| {
-            (
-                e["variable_id"].as_str().expect("variable_id").to_string(),
-                e["digest"].as_str().expect("digest").to_string(),
-            )
-        })
-        .collect()
-}
-
 fn raw_latest_definitions() -> BTreeMap<String, Value> {
     let doc: Value = serde_json::from_str(&read_repo_file(
         "drivers/sinumerik-nck/definitions/828d/r2.json",
@@ -395,12 +358,11 @@ async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_availab
     assert_eq!(row["category"], "machine_data");
     assert_eq!(row["category_basis"], "definition");
     assert_eq!(row["semantics_status"], "candidate");
-    assert_eq!(
-        row["source"].as_array().unwrap().iter().any(|s| {
+    assert!(
+        !row["source"].as_array().unwrap().iter().any(|s| {
             s["kind"] == "measurement"
                 && s["reference"] == "docs/evidence/nck-live-identity-probe.txt"
-        }),
-        false
+        })
     );
 
     let historical = catalog_json(json!({
