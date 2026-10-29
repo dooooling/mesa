@@ -45,6 +45,8 @@ pub const MIN_DEFINITION_REVISION: u32 = 1;
 /// 内嵌定义数据（`include_str!` 的相对深度与既有内嵌数据文件同模式：数据目录
 /// 与 `src/` 平级，见边界文档 §3.1 C5）。
 pub const EMBEDDED_DEFINITIONS_828D_R1: &str = include_str!("../definitions/828d/r1.json");
+/// Revision 2 definitions (formal category field + corrected encoder evidence).
+pub const EMBEDDED_DEFINITIONS_828D_R2: &str = include_str!("../definitions/828d/r2.json");
 /// 内嵌摘要清单（已发布 `(variable_id, revision)` 的 canonical-JSON SHA-256）。
 pub const EMBEDDED_DEFINITIONS_828D_LOCK: &str = include_str!("../definitions/828d/DIGESTS.lock");
 
@@ -400,61 +402,65 @@ pub struct DefinitionCatalog {
 }
 
 impl DefinitionCatalog {
-    /// 编译期内嵌目录（装载即全量自检 + 摘要比对）。
+    /// 编译期内嵌目录（所有已发布 revision 一并装载并核验摘要）。
     pub fn embedded() -> Result<Self, CatalogError> {
-        Self::load(EMBEDDED_DEFINITIONS_828D_R1, EMBEDDED_DEFINITIONS_828D_LOCK)
+        Self::load_multiple(
+            &[EMBEDDED_DEFINITIONS_828D_R1, EMBEDDED_DEFINITIONS_828D_R2],
+            EMBEDDED_DEFINITIONS_828D_LOCK,
+        )
     }
 
-    /// 从「定义数据 + 摘要清单」装载（`embedded()` 与测试共用同一路径）。
+    /// 从单个定义文件装载（用于兼容性测试与旧版数据校验）。
     pub fn load(definitions_json: &str, digests_json: &str) -> Result<Self, CatalogError> {
-        let doc: DefinitionDoc = serde_json::from_str(definitions_json)
-            .map_err(|e| CatalogError::Json(e.to_string()))?;
-        if doc.format_version != DEFINITION_FORMAT_VERSION {
-            return Err(CatalogError::UnsupportedFormatVersion(doc.format_version));
+        Self::load_multiple(&[definitions_json], digests_json)
+    }
+
+    /// 从多个不可变 revision 文件和一个完整摘要锁装载。
+    pub fn load_multiple(definition_docs: &[&str], digests_json: &str) -> Result<Self, CatalogError> {
+        if definition_docs.is_empty() {
+            return Err(CatalogError::Json("至少需要一个定义文件".into()));
         }
         let lock: LockDoc = serde_json::from_str(digests_json)
             .map_err(|e| CatalogError::LockJson(e.to_string()))?;
         if lock.format_version != DEFINITION_FORMAT_VERSION {
             return Err(CatalogError::UnsupportedFormatVersion(lock.format_version));
         }
-        if !lock.family.is_empty() && lock.family != doc.family {
-            return Err(CatalogError::LockJson(format!(
-                "Lock family `{}` 与定义 family `{}` 不一致",
-                lock.family, doc.family
-            )));
-        }
         let mut locks = BTreeMap::new();
         for e in &lock.entries {
-            if locks
-                .insert((e.variable_id.clone(), e.revision), e.digest.clone())
-                .is_some()
-            {
-                return Err(CatalogError::LockJson(format!(
-                    "条目重复：{}@{}",
-                    e.variable_id, e.revision
-                )));
+            if locks.insert((e.variable_id.clone(), e.revision), e.digest.clone()).is_some() {
+                return Err(CatalogError::LockJson(format!("条目重复：{}@{}", e.variable_id, e.revision)));
             }
         }
-        let mut catalog = Self {
-            by_id: BTreeMap::new(),
-            locks,
-        };
-        for def in doc.definitions {
-            if def.family != doc.family {
-                return Err(CatalogError::InvalidDefinition {
-                    variable_id: def.variable_id.clone(),
-                    revision: def.revision,
-                    reason: format!("family `{}` 与文件声明 `{}` 不一致", def.family, doc.family),
-                });
+        let mut catalog = Self { by_id: BTreeMap::new(), locks };
+        let mut family_seen: Option<String> = None;
+        for raw in definition_docs {
+            let doc: DefinitionDoc = serde_json::from_str(raw)
+                .map_err(|e| CatalogError::Json(e.to_string()))?;
+            if doc.format_version != DEFINITION_FORMAT_VERSION {
+                return Err(CatalogError::UnsupportedFormatVersion(doc.format_version));
             }
-            if def.revision != doc.revision {
-                return Err(CatalogError::InvalidDefinition {
-                    variable_id: def.variable_id.clone(),
-                    revision: def.revision,
-                    reason: format!("revision 与文件声明 `{}` 不一致", doc.revision),
-                });
+            if let Some(family) = &family_seen {
+                if family != &doc.family {
+                    return Err(CatalogError::Json(format!("定义文件 family 不一致：{family} 与 {}", doc.family)));
+                }
+            } else {
+                family_seen = Some(doc.family.clone());
             }
-            catalog.insert(def)?;
+            for def in doc.definitions {
+                if def.family != doc.family {
+                    return Err(CatalogError::InvalidDefinition {
+                        variable_id: def.variable_id.clone(), revision: def.revision,
+                        reason: format!("family `{}` 与文件声明 `{}` 不一致", def.family, doc.family),
+                    });
+                }
+                if def.revision != doc.revision {
+                    return Err(CatalogError::InvalidDefinition {
+                        variable_id: def.variable_id.clone(), revision: def.revision,
+                        reason: format!("revision 与文件声明 `{}` 不一致", doc.revision),
+                    });
+                }
+                catalog.insert(def)?;
+            }
         }
         catalog.verify_digests()?;
         Ok(catalog)
