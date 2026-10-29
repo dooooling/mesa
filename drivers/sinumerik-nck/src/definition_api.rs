@@ -28,6 +28,7 @@ use mesa_core_types::ErrorKind;
 use serde_json::{Map, Value};
 
 use crate::catalog_category::classify_category;
+use crate::definition::DefinitionCategory;
 use crate::compiler::{AddressCompiler, CompileError};
 use crate::definition::{
     CatalogError, DEFINITION_FORMAT_VERSION, DefinitionCatalog, DefinitionScope,
@@ -519,10 +520,17 @@ fn select_definitions<'a>(
         return Ok((vec![def], None));
     }
 
-    let defs: Vec<&VariableDefinition> = catalog
-        .iter()
-        .filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f))
-        .collect();
+    // 用户目录默认每个 variable_id 只返回最新 revision，避免树中出现重复叶子。
+    // 精确 revision 查询仍走上方 lookup 分支；旧点位编辑因此仍可读取它保存的版本。
+    let mut latest: BTreeMap<&str, &VariableDefinition> = BTreeMap::new();
+    for def in catalog.iter().filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f)) {
+        match latest.get(def.variable_id.as_str()) {
+            Some(existing) if existing.revision >= def.revision => {}
+            _ => { latest.insert(def.variable_id.as_str(), def); }
+        }
+    }
+    let mut defs: Vec<&VariableDefinition> = latest.into_values().collect();
+    defs.sort_by(|a, b| a.variable_id.as_bytes().cmp(b.variable_id.as_bytes()));
     let note = match (&query.family, defs.is_empty()) {
         (Some(f), true) => Some(format!(
             "系列 `{f}` 已在驱动中声明，但当前没有任何已发布定义（这是空目录，不是驱动故障）"
@@ -568,11 +576,17 @@ fn project(def: &VariableDefinition) -> Result<Value, DefinitionApiError> {
         })?;
         out.insert(key.to_string(), value.clone());
     }
-    // 导航分类（附加字段，见函数文档）：`category_basis` 是自证字段，取值本轮
-    // **恒为** `navigation_rule`，让任何消费者都能看出这不是手册事实。
-    let assignment = classify_category(def);
-    out.insert("category".into(), Value::from(assignment.category.as_str()));
-    out.insert("category_basis".into(), Value::from(assignment.basis));
+    // Revision 2 起 category 是正式定义字段并参与 digest；旧 revision 1 继续使用
+    // 临时导航规则投影，且明确标记 basis，保证历史定义可读但不伪装为权威分类。
+    let (category, basis) = match def.category {
+        Some(category) => (category.as_str(), "definition"),
+        None => {
+            let assignment = classify_category(def);
+            (assignment.category.as_str(), assignment.basis)
+        }
+    };
+    out.insert("category".into(), Value::from(category));
+    out.insert("category_basis".into(), Value::from(basis));
     Ok(Value::Object(out))
 }
 
