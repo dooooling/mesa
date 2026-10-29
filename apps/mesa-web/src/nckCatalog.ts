@@ -437,6 +437,8 @@ export interface NckCatalogPageRequest {
   limit?: number;
   /** 上一页的 `next_cursor`，**逐字**回传。 */
   cursor?: string;
+  /** 显式请求所有已发布 revision，供已有点位的精确历史核验；普通用户目录不必启用。 */
+  includeHistory?: boolean;
 }
 
 export type NckFetchLike = (
@@ -454,6 +456,7 @@ export async function fetchNckCatalogPage(
   if (request.limit !== undefined) query.set("limit", String(request.limit));
   // 逐字回传：不解析、不重构、不补默认值。游标形态由驱动定义（v1-<id>-<rev>）。
   if (request.cursor !== undefined) query.set("cursor", request.cursor);
+  if (request.includeHistory === true) query.set("include_history", "true");
   const suffix = query.toString() ? `?${query.toString()}` : "";
   const path = `/api/v1/drivers/${encodeURIComponent(request.driverId)}/definitions${suffix}`;
   let response: Pick<Response, "ok" | "status" | "json">;
@@ -489,6 +492,8 @@ export interface NckCatalogLoadOptions {
   driverId: string;
   family?: string;
   limit?: number;
+  /** 读取全部历史 revision（默认 false，仅返回每个变量的最新 revision）。 */
+  includeHistory?: boolean;
   /** 防御性上限：契约正常时页数 = ceil(total/limit)。 */
   maxPages?: number;
   fetchImpl?: NckFetchLike;
@@ -510,6 +515,7 @@ export async function fetchNckCatalog(options: NckCatalogLoadOptions): Promise<N
             family: options.family,
             limit: options.limit,
             cursor,
+            includeHistory: options.includeHistory,
           },
           fetchImpl,
         ),
