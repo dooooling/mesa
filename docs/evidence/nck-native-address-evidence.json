@@ -2,7 +2,7 @@
   "schema_version": 2,
   "purpose": "Separate NCK wire-format evidence, Siemens manual semantic evidence, and live-device observations. This matrix does not certify address mappings beyond the evidence stated per row; each row names the evidence class that carries each claim, and no manual semantic match is accepted as proof of a native module value.",
   "baseline": {
-    "main_commit": "dae035ea7b7f683d7b51fffc5f1637aeac8e7bec",
+    "main_commit": "b3005f0b6dc4b6fbc45af2881b1568df7b230439",
     "r1_path": "drivers/sinumerik-nck/definitions/828d/r1.json",
     "r1_blob_sha1": "3c0abe67cbcb64b525cddec1584e6e1747e0f062",
     "real_828d_test_in_this_change": false
@@ -831,12 +831,12 @@
     },
     {
       "id": "axis.encoder.module_number",
-      "question": "The cited measurement evidence does not contain this probe result; exercise the real probe path or withdraw the unsupported measurement claim.",
+      "question": "The historical revision 1 measurement claim is preserved for immutability; confirm native encoder module/area_no/line mapping through authoritative or separately authorized device evidence.",
       "status": "open",
       "do_not_infer": true,
-      "note": "Audit verdict: the cited measurement evidence does not contain this probe result, and the probe constant is never exercised. Retraction is DECIDED but NOT APPLIED to the effective definition, which still carries the claim. Do not treat the audit record as proof that the production definition is clean.",
-      "retraction_state": "retraction_pending_definition_rev",
-      "effective_definition_still_carries_claim": true,
+      "note": "Revision 2 removes the unsupported measurement source and downgrades semantics_status to candidate. Revision 1 remains immutable and still contains the historical claim; exact revision-1 lookup is historical, not current validation. Native module=26, line=1 and area_no mapping remain unresolved; no live hardware test is claimed.",
+      "retraction_state": "corrected_in_revision_2_historical_revision_1_preserved",
+      "effective_definition_still_carries_claim": false,
       "effective_definition": {
         "file": "drivers/sinumerik-nck/definitions/828d/r1.json",
         "variable_id": "axis.encoder.module_number",
@@ -845,7 +845,14 @@
         "offending_source_kind": "measurement",
         "offending_source_reference": "docs/evidence/nck-live-identity-probe.txt"
       },
-      "why_not_retracted_in_place": "The definition catalogue forbids in-place modification of a published (variable_id, revision) and provides no retraction/supersede mechanism: DIGESTS.lock must match definitions 1:1 (MissingLockEntry / UnexpectedLockEntry). Removing the claim therefore requires publishing a new revision or a reviewed definition revision, neither of which this change performs."
+      "why_not_retracted_in_place": "Published revision 1 remains immutable by design. The unsupported measurement claim is removed in revision 2, with a new digest lock entry; revision 1 remains available for historical exact lookups. This corrects the current definition without rewriting published history.",
+      "current_definition": {
+        "file": "drivers/sinumerik-nck/definitions/828d/r2.json",
+        "variable_id": "axis.encoder.module_number",
+        "revision": 2,
+        "semantics_status": "candidate",
+        "offending_source_present": false
+      }
     },
     {
       "id": "manual-entry-page-traceability",
