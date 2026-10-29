@@ -224,6 +224,18 @@ pub enum DefinitionCategory {
     Unclassified,
 }
 
+impl DefinitionCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CncVariable => "cnc_variable",
+            Self::SystemVariable => "system_variable",
+            Self::MachineData => "machine_data",
+            Self::DriveParameter => "drive_parameter",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
 /// 单条变量定义（**NCK Driver 侧类型**，Core 不可见）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -793,6 +805,12 @@ fn validate_definition(def: &VariableDefinition) -> Result<(), CatalogError> {
     }
     if def.revision < MIN_DEFINITION_REVISION {
         return Err(fail(format!("revision 必须 >= {MIN_DEFINITION_REVISION}")));
+    }
+    if def.revision >= 2 && def.category.is_none() {
+        return Err(fail("revision >= 2 必须声明正式 category".into()));
+    }
+    if def.revision == 1 && def.category.is_some() {
+        return Err(fail("revision 1 已冻结，不得新增 category；请发布新 revision".into()));
     }
     if def.family.trim().is_empty() {
         return Err(fail("family 不得为空".into()));
