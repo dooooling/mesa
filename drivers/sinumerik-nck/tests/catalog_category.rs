@@ -4,7 +4,7 @@
 //!
 //! 分类是驱动侧为了前端建树临时定的**导航规则**，不是手册确认的事实。因此这里
 //! 不只测「分了什么」，还测「分类敢不敢自证」：每行必须带
-//! `category_basis = "navigation_rule"`，且 `r1.json` 里绝不能出现分类字段
+//! 最新 revision 的 `category_basis = "definition"`，且历史 `r1.json` 里绝不能出现分类字段
 //! （定义已冻结，分类不得伪装成定义的一部分）。
 //!
 //! ## 只读性
@@ -94,7 +94,7 @@ const CATEGORY_CODES: [&str; 5] = [
 // ---------------------------------------------------------------------------
 
 /// 42 条**逐条**都有 `category`，且取值只能是五个码之一；`category_basis` 恒为
-/// `"navigation_rule"`（不允许出现「definition / manual / verified」这类越权声明）。
+/// `"definition"`（最新 revision 已将 category 纳入摘要锁，不再使用投影期导航规则）。
 #[tokio::test]
 async fn every_definition_declares_a_legal_navigation_category() {
     let v = catalog_json().await;
@@ -115,8 +115,8 @@ async fn every_definition_declares_a_legal_navigation_category() {
             .as_str()
             .unwrap_or_else(|| panic!("{id} 缺 `category_basis`"));
         assert_eq!(
-            basis, CATEGORY_BASIS_NAVIGATION_RULE,
-            "{id} 的 category_basis 必须恒为 navigation_rule（本轮不得声称定义/手册已确认）"
+            basis, "definition",
+            "{id} 的最新 revision 必须由正式定义字段提供 category_basis=definition"
         );
         for forbidden in ["definition", "manual", "verified", "authoritative"] {
             assert_ne!(
