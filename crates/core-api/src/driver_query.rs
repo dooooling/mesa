@@ -47,6 +47,7 @@ pub(crate) struct DefinitionsQuery {
     revision: Option<String>,
     limit: Option<String>,
     cursor: Option<String>,
+    include_history: Option<String>,
 }
 
 /// `GET /api/v1/drivers/{id}/definitions`（§4.1 / §4.2）。
@@ -79,6 +80,13 @@ pub(crate) async fn definitions(
         }
     }
 
+    // ③ include_history：只接受显式 true/false；默认 false 保持普通目录的最新版本视图。
+    let include_history = match q.include_history.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return invalid_query("include_history 必须是 true 或 false"),
+    };
+
     // ③ cursor 与 variable_id 互斥（游标语义 = 上一页末条，不能再叠加精确过滤）
     if q.cursor.is_some() && q.variable_id.is_some() {
         return invalid_query("cursor 与 variable_id 互斥");
@@ -106,6 +114,9 @@ pub(crate) async fn definitions(
     body.insert("limit".into(), serde_json::Value::from(limit));
     if let Some(cursor) = &q.cursor {
         body.insert("cursor".into(), serde_json::Value::from(cursor.clone()));
+    }
+    if include_history {
+        body.insert("include_history".into(), serde_json::Value::Bool(true));
     }
     let query_json = serde_json::Value::Object(body).to_string();
 
