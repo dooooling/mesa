@@ -30,6 +30,7 @@ import { NATIVE_RESOURCE } from "../test/acquisitionFixture238";
 import type { AcquisitionTaskShape, NckPointSelection } from "../deviceModel";
 import type { ResourceDescriptor } from "../types";
 import contract from "../test/nckIdentityProbeContract.json";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const EP = "ep-flow";
 const DRIVER = "sinumerik-nck";
@@ -114,6 +115,7 @@ function definitionOf(overrides: Record<string, unknown>): Record<string, unknow
     targets: [],
     target_required: [],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: "",
     identity_keys: [],
     golden_ref: [],

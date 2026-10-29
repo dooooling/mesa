@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { invokeDisabledButton } from "../test/bypassDisabled";
 import { renderAddDeviceFlow as renderFlow } from "../test/addDeviceFlowHarness";
 import { selectVariableViaTreeWith } from "../test/catalogTreePick";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 beforeEach(() => {
   vi.useRealTimers();
@@ -88,6 +89,7 @@ function nckDefinition(variableId: string, overrides: Record<string, unknown> = 
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: `${variableId}@channel={channel}`,
     identity_keys: [{ path: "channel", required: true }],
     golden_ref: [],

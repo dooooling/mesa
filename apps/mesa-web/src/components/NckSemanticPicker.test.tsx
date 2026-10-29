@@ -7,6 +7,7 @@ import { NckSemanticPicker } from "./NckSemanticPicker";
 import type { NckPreviewFn } from "./NckPointFields";
 import type { NckDefinitionLike } from "../nckPointModel";
 import { selectVariableViaTree } from "../test/catalogTreePick";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const definition: NckDefinitionLike = {
   variable_id: "syn.semantic",
@@ -16,6 +17,7 @@ const definition: NckDefinitionLike = {
   targets: ["channel"],
   target_required: ["channel"],
   arguments: [],
+  availability: CANDIDATE_AVAILABILITY,
 };
 
 const preview: NckPreviewFn = async (req) => ({

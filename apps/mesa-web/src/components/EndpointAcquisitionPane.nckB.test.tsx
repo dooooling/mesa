@@ -25,6 +25,7 @@ import {
   type ResourceSelection,
 } from "../deviceModel";
 import type { NckCatalogDefinition, NckDefinitionsResponse } from "../nckCatalog";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-nck";
@@ -62,6 +63,7 @@ function catDefinition(
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: `${variableId}@channel={channel}`,
     identity_keys: [{ path: "channel", required: true }],
     golden_ref: [{ entry: "nc_variable" }],
@@ -335,6 +337,7 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -420,6 +423,7 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
           "syn.collect.b": {
             variable_id: "syn.collect.b",
@@ -429,6 +433,7 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -482,6 +487,7 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -547,6 +553,7 @@ describe("门禁 9：存量 identity 点位 → 显式移除 → 重验剩余 �
             targets: ["axis"],
             target_required: ["axis"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
           "syn.collect.a": {
             variable_id: "syn.collect.a",
@@ -556,6 +563,7 @@ describe("门禁 9：存量 identity 点位 → 显式移除 → 重验剩余 �
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -626,6 +634,7 @@ describe("门禁 6：已有点位预览失败 ⇒ 不得按旧 Key 继续提交"
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -651,6 +660,7 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
         targets: ["channel"],
         target_required: ["channel"],
         arguments: [],
+        availability: CANDIDATE_AVAILABILITY,
       },
     };
     const { rerender } = render(
@@ -741,6 +751,7 @@ describe("PR-C 第三批：Endpoint 页 native 存量点位复核（A24–A27）
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -811,6 +822,7 @@ describe("P1：Endpoint 层最终保存守卫（完整 Schema）", () => {
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,
@@ -955,6 +967,7 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
             targets: ["channel"],
             target_required: ["channel"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
           "syn.identity.a": {
             variable_id: "syn.identity.a",
@@ -964,6 +977,7 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
             targets: ["axis"],
             target_required: ["axis"],
             arguments: [],
+            availability: CANDIDATE_AVAILABILITY,
           },
         }}
       />,

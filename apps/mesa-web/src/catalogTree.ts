@@ -17,6 +17,8 @@
 // UI 必须让用户/开发者一眼看出这一点（见 `describeCategoryBasis`），否则
 // "按分类找到的变量"会被误读成"手册说它属于这一类"。
 
+import { readDefinitionMeta, type DefinitionMetaView } from "./definitionMeta";
+
 /** 后端分类词表（`CatalogCategory::as_str()`，与驱动侧一一对应，**不新增第六个**）。 */
 export const CATALOG_CATEGORY = {
   CNC_VARIABLE: "cnc_variable",
@@ -115,6 +117,17 @@ export interface CatalogTreeDefinitionLike {
   label?: unknown;
   category?: unknown;
   category_basis?: unknown;
+  /**
+   * 四块 sidecar 元数据（单位 / 手册位置 / 索引规则 / 可用性）。
+   *
+   * 一律按 `unknown` 读取：这是**后端数据**，形状与取值都必须容错（缺失、类型漂移
+   * 都不能崩，也不能补默认值）。归一化与判据只在 `definitionMeta.ts` 里写一次，
+   * 本文件只负责把它带进树的每个条目。
+   */
+  unit?: unknown;
+  manual_location?: unknown;
+  index_rule?: unknown;
+  availability?: unknown;
 }
 
 /** 树里的一个可选项。 */
@@ -139,6 +152,13 @@ export interface CatalogTreeItem<T> {
   explicitlyUnclassified: boolean;
   /** 分类依据的可读形态（角标 + tooltip）。 */
   basis: CategoryBasisView;
+  /**
+   * sidecar 四块的可读形态（单位 / 手册位置 / 索引规则 / 可用性）。
+   *
+   * 在归类时**一次**算好：树上展示与表单门禁必须读同一份结论，否则会出现
+   * "树上写可用、表单说不可添加"这种自相矛盾的界面。
+   */
+  meta: DefinitionMetaView;
 }
 
 /** 一个分组。 */
@@ -210,6 +230,7 @@ export function classifyCatalogDefinition<T extends CatalogTreeDefinitionLike>(
     categoryKnown: known && bucket !== CATALOG_CATEGORY.UNCLASSIFIED,
     explicitlyUnclassified: rawCategory === CATALOG_CATEGORY.UNCLASSIFIED,
     basis,
+    meta: readDefinitionMeta(definition),
   };
 }
 

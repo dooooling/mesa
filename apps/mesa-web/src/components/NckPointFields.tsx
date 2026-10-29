@@ -22,6 +22,11 @@
 //    用于省流量，不是竞态防线。
 // 3. **迟到响应整份丢弃**：请求序号 + 输入指纹都匹配才采纳；被丢弃的响应
 //    不得在任何文案/状态里留下痕迹。
+// 4. **可用性门禁 fail-closed**：`availability`（sidecar 静态元数据）为
+//    `hold` / `reference_only` / 缺失 / 取值非法时禁止添加，并把原因**可见**地
+//    摆出来；`candidate` 允许走流程但添加处必须标注"未经真机读取验证"。
+//    静态可用性（元数据）与动态对象（本机探测）**分开显示**：`ready` 不代表
+//    当前机床存在该对象。判定全部收敛在 `definitionMeta.evaluateAvailabilityGate`。
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, Input, Space, Tag, Tooltip } from "antd";
 import type { SchemaDescriptor } from "../types";
@@ -31,6 +36,14 @@ import {
   evaluateNckSelectionAdd,
 } from "../nckCollectability";
 import { classifyCatalogDefinition, evaluateCategoryGate } from "../catalogTree";
+import {
+  AVAILABILITY_TAG_COLOR,
+  STATIC_AVAILABILITY_NOTE,
+  describeObjectDynamicState,
+  evaluateAvailabilityGate,
+  objectDynamicState,
+  readDefinitionMeta,
+} from "../definitionMeta";
 import { CatalogCategoryTree } from "./CatalogCategoryTree";
 import { ObjectProbePanel } from "./ObjectProbePanel";
 import {
@@ -219,11 +232,22 @@ export function NckPointFields({
     [definition],
   );
   const categoryGate = useMemo(() => evaluateCategoryGate(categoryItem), [categoryItem]);
+  // sidecar 元数据（单位 / 手册位置 / 索引规则 / 可用性）：树上与表单读同一份结论。
+  const meta = useMemo(() => readDefinitionMeta(definition), [definition]);
+  // 可用性门禁（**fail-closed**）：`availability` 缺失或取值非法一律阻断，
+  // 绝不"默认放行"——那是把"驱动没说"当成"驱动说可以"。
+  const availabilityGate = useMemo(() => evaluateAvailabilityGate(meta.availability), [meta]);
   // 需要的对象类型：wire 的 identity.keys 优先，定义 targets/target_required 补足。
   const objectNeeds = useMemo(
     () => resolveObjectNeeds({ definition, identityKeys: objectIdentityKeys }),
     [definition, objectIdentityKeys],
   );
+  // 静态可用性（sidecar）× 动态对象（本机探测）分开呈现：
+  // `ready` 只说明元数据层面可用，**不代表**当前机床存在该对象。
+  const dynamicState = objectDynamicState({
+    needCount: objectNeeds.length,
+    filledFromDevice: fillNotice !== null,
+  });
   const resolvedProbeGate = useMemo<ObjectProbeGate>(
     () =>
       probeGate ??
@@ -363,6 +387,7 @@ export function NckPointFields({
     !!definition &&
     categoryGate.ok &&
     admission.ok &&
+    availabilityGate.ok &&
     familyCheck.ok &&
     model.ok &&
     validation.ok &&
@@ -404,6 +429,9 @@ export function NckPointFields({
     const gate = evaluateNckSelectionAdd(definition);
     // 分类守卫同为"提交时重跑"：待分类（明确 unclassified）不得作为可采集点位。
     const category = evaluateCategoryGate(classifyCatalogDefinition(definition));
+    // 可用性门禁同样"提交时重跑"：不信任渲染期的按钮可用状态
+    // （深链、旧缓存、被改写的组件状态都可能绕过 UI）。
+    const availability = evaluateAvailabilityGate(readDefinitionMeta(definition).availability);
     const family = checkNckFamily({
       endpointFamily,
       definitionFamily: definition.family,
@@ -415,6 +443,7 @@ export function NckPointFields({
     if (
       !category.ok ||
       !gate.ok ||
+      !availability.ok ||
       !family.ok ||
       !currentModel.ok ||
       !currentValidation.ok ||
@@ -532,12 +561,44 @@ export function NckPointFields({
       />
 
       {definition ? (
-        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+        <div
+          data-testid="nck-definition-meta-row"
+          style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}
+        >
           <Space size={4} data-testid="nck-definition-tags">
             <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
             <Tag>{String(definition.semantics_status ?? "状态未提供")}</Tag>
             {typeof definition.revision === "number" ? <Tag>rev {definition.revision}</Tag> : null}
           </Space>
+          {/*
+            单位：`verified` 才显示真实取值，其余明确写"单位未核实"——
+            空白会被读成"无单位"，假单位比空白更糟（见 definitionMeta.readUnitMeta）。
+          */}
+          <Tooltip title={meta.unit.hint}>
+            <Tag data-testid="nck-unit" data-unit-status={meta.unit.status}>
+              {meta.unit.label}
+            </Tag>
+          </Tooltip>
+          {/* 索引规则：逐字展示驱动声明，未核实如实标注（不推断索引方式）。 */}
+          <Tooltip title={meta.indexRule.hint}>
+            <Tag data-testid="nck-index-rule" data-index-status={meta.indexRule.status ?? ""}>
+              索引：{meta.indexRule.label}
+            </Tag>
+          </Tooltip>
+          {/* 手册位置（页码/章节）：tooltip + data 属性可查，不占主视觉。 */}
+          {meta.manualLocation.label ? (
+            <Tooltip title={meta.manualLocation.hint}>
+              <Tag
+                data-testid="nck-manual-location"
+                data-page={meta.manualLocation.page ?? ""}
+                data-section={meta.manualLocation.section ?? ""}
+                data-document={meta.manualLocation.documentNumber ?? ""}
+                style={{ fontSize: 10 }}
+              >
+                手册：{meta.manualLocation.label}
+              </Tag>
+            </Tooltip>
+          ) : null}
           {/* 分类与分类依据：一行说清"这是导航规则，不是手册事实"。 */}
           {categoryItem ? (
             <>
@@ -658,6 +719,82 @@ export function NckPointFields({
       ) : null}
 
       {/*
+        可用性（sidecar `availability`）：**静态**元数据结论，与"本机是否有该对象"
+        分开显示（后者见下方 nck-object-dynamic-state 与对象探测面板）。
+        四态都可见；`hold` 的原因必须直接读得到，不藏在 tooltip 里。
+      */}
+      {definition ? (
+        <div
+          data-testid="nck-availability"
+          data-state={meta.availability.state}
+          style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}
+        >
+          <Tag
+            data-testid="nck-availability-tag"
+            data-availability={meta.availability.state}
+            color={AVAILABILITY_TAG_COLOR[meta.availability.state]}
+            style={{ marginInlineEnd: 0 }}
+          >
+            {meta.availability.label}
+          </Tag>
+          {meta.availability.state === "hold" ? (
+            <span
+              data-testid="nck-availability-hold-reason"
+              style={{ fontSize: 11, color: "#c62828" }}
+            >
+              暂缓原因：{meta.availability.reasonZh ?? "驱动未给出原因"}
+            </span>
+          ) : null}
+          {meta.availability.state === "candidate" ? (
+            <span
+              data-testid="nck-availability-candidate-notice"
+              style={{ fontSize: 11, color: "#8c6000" }}
+            >
+              未经真机读取验证（可配置，但不得当作已验证）
+            </span>
+          ) : null}
+          {meta.availability.basis.length ? (
+            <span data-testid="nck-availability-basis" style={{ fontSize: 11, color: "#8c8c8c" }}>
+              依据：{meta.availability.basis.join(" / ")}
+            </span>
+          ) : null}
+          <span
+            data-testid="nck-availability-static-note"
+            style={{ fontSize: 11, color: "#8c8c8c" }}
+          >
+            {STATIC_AVAILABILITY_NOTE}
+          </span>
+        </div>
+      ) : null}
+
+      {/*
+        可用性门禁（fail-closed）：`hold` / `reference_only` / 缺失 / 非法取值
+        一律禁止添加，并把原因**可见**地摆出来（不静默禁用按钮）。
+      */}
+      {definition && !availabilityGate.ok ? (
+        <Alert
+          type="error"
+          showIcon
+          data-testid="nck-availability-block"
+          data-code={availabilityGate.code}
+          message={`不可添加：${availabilityGate.code}`}
+          description={
+            <span>
+              {availabilityGate.message}
+              {availabilityGate.reasonZh ? (
+                <>
+                  <br />
+                  驱动给出的原因（reason_zh）：{availabilityGate.reasonZh}
+                </>
+              ) : null}
+              <br />
+              {STATIC_AVAILABILITY_NOTE}。本判定来自定义元数据，不会因探测到本机对象而改变。
+            </span>
+          }
+        />
+      ) : null}
+
+      {/*
         统一流程第 ②步：只有定义声明了对象实例需求（targets / target_required 或
         wire 的 identity.keys）时才出现「探测实际对象」入口；点击才发请求。
       */}
@@ -676,6 +813,20 @@ export function NckPointFields({
           {fillNotice.unresolved.length
             ? ` · 仍需手动填写：${fillNotice.unresolved.join(" / ")}（前端不填默认值）`
             : ""}
+        </div>
+      ) : null}
+      {/*
+        静态可用性 × 动态对象的**分离显示**：这一行只讲"本机对象确认到什么程度"，
+        与上面的 `nck-availability`（元数据结论）各自独立，互不替代。
+        `ready` + 未探测 ⇒ 这里明确写"未探测确认"，不给出虚假的可用配置。
+      */}
+      {definition ? (
+        <div
+          data-testid="nck-object-dynamic-state"
+          data-object-state={dynamicState}
+          style={{ fontSize: 11, color: "#525252" }}
+        >
+          本机对象（动态）：{describeObjectDynamicState(dynamicState)}
         </div>
       ) : null}
 
@@ -866,7 +1017,7 @@ export function NckPointFields({
         ) : null}
       </div>
 
-      <div style={{ display: "flex", gap: 8 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <Button
           type="primary"
           data-testid="nck-add-point"
@@ -875,6 +1026,19 @@ export function NckPointFields({
         >
           {submitLabel ?? "加入点位"}
         </Button>
+        {/*
+          `candidate` 允许走流程，但**添加处必须标注**"未经真机读取验证"：
+          允许 ≠ 已验证，标注放在按钮旁边，避免"加进去就当成已核实"。
+        */}
+        {availabilityGate.ok && availabilityGate.requiresUnverifiedNotice ? (
+          <Tag
+            data-testid="nck-add-unverified-notice"
+            color="gold"
+            style={{ marginInlineEnd: 0 }}
+          >
+            {availabilityGate.notice}
+          </Tag>
+        ) : null}
         {onCancel ? (
           <Button size="small" onClick={onCancel}>
             取消编辑

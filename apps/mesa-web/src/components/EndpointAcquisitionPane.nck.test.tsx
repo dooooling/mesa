@@ -24,6 +24,7 @@ import {
   type ResourceSelection,
 } from "../deviceModel";
 import { catalogLeafIds } from "../test/catalogTreePick";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-nck";
@@ -161,6 +162,7 @@ function buildDefinitions(): NckDefinitionMap {
       targets: ["channel"],
       target_required: ["channel"],
       arguments: [],
+      availability: CANDIDATE_AVAILABILITY,
       label: `Collect ${i}`,
     };
   }
@@ -174,6 +176,7 @@ function buildDefinitions(): NckDefinitionMap {
       targets: ["axis"],
       target_required: ["axis"],
       arguments: [],
+      availability: CANDIDATE_AVAILABILITY,
     };
   }
   return out;

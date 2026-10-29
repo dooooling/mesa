@@ -71,6 +71,51 @@ export interface NckCatalogGoldenRef {
   entry?: string;
 }
 
+/**
+ * 单位声明（sidecar `unit`）。
+ *
+ * 三个字段都按"原文"保留：`status` 用 `string` 而不是联合类型，是因为它是**后端
+ * 数据**——前端只允许逐字采用或按未核实处理，用联合类型归一化会把非法取值掩盖成
+ * "合法状态"。判据与展示收敛在 `definitionMeta.readUnitMeta`。
+ */
+export interface NckUnitMeta {
+  /** 单位原文（可能含多种并列取值，如 `mm/min, inch/min, user defined`）。 */
+  value: string | null;
+  source_ref: string | null;
+  /** 驱动声明的状态（`verified` / `unknown` / 其它）。 */
+  status: string | null;
+}
+
+/** 手册位置声明（sidecar `manual_location`）：页码/章节只在详情或 tooltip 中展示。 */
+export interface NckManualLocationMeta {
+  document_number: string | null;
+  version: string | null;
+  section: string | null;
+  page: number | null;
+  source_ref: string | null;
+}
+
+/** 索引规则声明（sidecar `index_rule`）：`kind` 是数据，前端不做任何归类推断。 */
+export interface NckIndexRuleMeta {
+  kind: string | null;
+  status: string | null;
+  source_ref: string | null;
+}
+
+/**
+ * 可用性声明（sidecar `availability`）。
+ *
+ * `state` 保持 `string`（不归一化到四态联合类型）：非法取值必须能被**逐字**带进
+ * 门禁文案，而不是在类型层被静默改成某个合法值。四态白名单判定见
+ * `definitionMeta.readAvailabilityMeta` / `evaluateAvailabilityGate`。
+ */
+export interface NckAvailabilityMeta {
+  state: string;
+  /** 依据码（如 `no_device_read`），只展示、不参与判定。 */
+  basis: string[];
+  reason_zh: string | null;
+}
+
 /** I-2 目录条目：**14 字段白名单投影**（definition_api.rs:56-71）。 */
 export interface NckCatalogDefinition {
   variable_id: string;
@@ -103,6 +148,25 @@ export interface NckCatalogDefinition {
    * UI 必须展示或可查（见 `catalogTree.describeCategoryBasis`）。
    */
   category_basis?: string | null;
+  /**
+   * 单位（sidecar，可选）。
+   *
+   * 缺失或形状非法 ⇒ 字段**不出现**（等价于"单位未知"）。这四个 sidecar 块与
+   * 14 字段白名单的"缺一个即整体拒绝"不同：它们是附加信息，缺了不影响采集能力，
+   * 但**绝不允许**补默认值或猜一个单位（判据见 `definitionMeta.readUnitMeta`）。
+   */
+  unit?: NckUnitMeta;
+  /** 手册位置（sidecar，可选；缺失/非法同样收敛为"未提供"）。 */
+  manual_location?: NckManualLocationMeta;
+  /** 索引规则（sidecar，可选；缺失/非法同样收敛为"未声明"）。 */
+  index_rule?: NckIndexRuleMeta;
+  /**
+   * 可用性（sidecar，可选）。
+   *
+   * **注意**：`undefined` 在门禁层等价于 `AVAILABILITY_MISSING`（fail-closed 阻断），
+   * 不是"默认放行"。判定见 `definitionMeta.evaluateAvailabilityGate`。
+   */
+  availability?: NckAvailabilityMeta;
 }
 
 /** I-2 目录响应：**10 字段分页信封**（definition_api.rs:260-282）。 */
@@ -280,6 +344,75 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
 
+/** 非空字符串或 null（空串按"未提供"处理：空串不构成事实）。 */
+function readText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/** 正整数或 null（页码只认 >=1 的整数，字符串/小数/0 一律不认）。 */
+function readPageNumber(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) return null;
+  return value;
+}
+
+/**
+ * 容错解析 `unit`：形状非法返回 `undefined`（= 单位未知）。
+ *
+ * 为什么"容错"而不是"缺字段即整页拒绝"：sidecar 是**附加**元数据，形状漂移不该
+ * 让整份目录不可用（那会把"单位没写清"升级成"采集功能全挂"）；但同样不允许把
+ * 非法形状猜成某个单位——`undefined` 在展示层固定落到"单位未核实"。
+ */
+export function parseUnitMeta(value: unknown): NckUnitMeta | undefined {
+  if (!isPlainObject(value)) return undefined;
+  return {
+    value: readText(value.value),
+    source_ref: readText(value.source_ref),
+    status: readText(value.status),
+  };
+}
+
+/** 容错解析 `manual_location`：不是对象即视为未提供。 */
+export function parseManualLocationMeta(value: unknown): NckManualLocationMeta | undefined {
+  if (!isPlainObject(value)) return undefined;
+  return {
+    document_number: readText(value.document_number),
+    version: readText(value.version),
+    section: readText(value.section),
+    page: readPageNumber(value.page),
+    source_ref: readText(value.source_ref),
+  };
+}
+
+/** 容错解析 `index_rule`：不是对象即视为未声明。 */
+export function parseIndexRuleMeta(value: unknown): NckIndexRuleMeta | undefined {
+  if (!isPlainObject(value)) return undefined;
+  return {
+    kind: readText(value.kind),
+    status: readText(value.status),
+    source_ref: readText(value.source_ref),
+  };
+}
+
+/**
+ * 容错解析 `availability`：只有"对象且 `state` 是非空字符串"才保留。
+ *
+ * 刻意保留**任意**字符串（含不在四态词表内的值）：那属于"驱动给了非法结论"，
+ * 必须在门禁文案里逐字可见（`AVAILABILITY_INVALID`），不能被解析层吞掉。
+ * 非对象 / 缺 state ⇒ `undefined`（= 未声明 ⇒ fail-closed 阻断）。
+ */
+export function parseAvailabilityMeta(value: unknown): NckAvailabilityMeta | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const state = readText(value.state);
+  if (state === null) return undefined;
+  return {
+    state,
+    basis: isStringArray(value.basis) ? [...value.basis] : [],
+    reason_zh: readText(value.reason_zh),
+  };
+}
+
 /**
  * 校验一页目录响应的形状（不做业务语义判断：family/revision/scope 留给调用方）。
  *
@@ -406,6 +539,12 @@ function parseDefinitionEntry(value: unknown, index: number): NckCatalogDefiniti
   ) {
     throw contractError(`${where}.category_basis 必须是字符串或 null`);
   }
+  // 四块 sidecar 一律**容错**：缺失/形状非法都收敛为"不出现该字段"，
+  // 由展示与门禁层统一按"未知 / 不可用"处理（不崩、不猜、不整页拒绝）。
+  const unit = parseUnitMeta(value.unit);
+  const manualLocation = parseManualLocationMeta(value.manual_location);
+  const indexRule = parseIndexRuleMeta(value.index_rule);
+  const availability = parseAvailabilityMeta(value.availability);
   return {
     variable_id: variableId,
     revision,
@@ -425,6 +564,10 @@ function parseDefinitionEntry(value: unknown, index: number): NckCatalogDefiniti
     ...(categoryBasis !== undefined && categoryBasis !== null
       ? { category_basis: categoryBasis }
       : {}),
+    ...(unit ? { unit } : {}),
+    ...(manualLocation ? { manual_location: manualLocation } : {}),
+    ...(indexRule ? { index_rule: indexRule } : {}),
+    ...(availability ? { availability } : {}),
   };
 }
 

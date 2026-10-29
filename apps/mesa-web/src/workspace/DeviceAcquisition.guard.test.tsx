@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { DeviceAcquisition } from "./DeviceAcquisition";
 import type { WorkspaceEndpoint } from "./useDeviceWorkspaceData";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const EP1 = "ep-guard-1";
 const EP2 = "ep-guard-2";
@@ -29,6 +30,7 @@ const DEFINITIONS = {
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
   },
 };
 

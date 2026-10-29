@@ -10,6 +10,7 @@ import { message } from "antd";
 import { EndpointAcquisitionPane, type NckDefinitionMap } from "./EndpointAcquisitionPane";
 import { NCK_POINTS_KIND, type AcquisitionTaskShape, type NckPointSelection } from "../deviceModel";
 import { selectVariableViaTreeWith } from "../test/catalogTreePick";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-flow";
@@ -24,6 +25,7 @@ const DEFINITIONS: NckDefinitionMap = {
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
   },
   "syn.collect.b": {
     variable_id: "syn.collect.b",
@@ -33,6 +35,7 @@ const DEFINITIONS: NckDefinitionMap = {
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
   },
 };
 

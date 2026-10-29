@@ -1,11 +1,15 @@
 // 变量目录树（**通用**组件：不认识任何厂商、协议或变量名前缀）。
 //
-// 只做四件事：
+// 只做五件事：
 // 1. 按后端 `category` 分五个分组（四类 + 「其他 / 待分类」）；
 // 2. 搜索（跨所有分类，命中即展开）；
 // 3. 展开 / 折叠 / 选择；
 // 4. 把 `category_basis` 如实标出来（角标 + tooltip），让"这是导航规则，
 //    不是手册事实"随时可查——但不喧宾夺主（只在分组标题上给一个小角标）。
+// 5. 把 sidecar 元数据摆在**叶子上**：单位（未核实就明写"单位未核实"）、可用性
+//    四态（不同颜色 + 文案；`hold` 的原因直接可见）、手册页码/章节（tooltip 可查）。
+//    判定与文案全部来自 `definitionMeta.ts`，本文件只排版——否则会出现
+//    "树上写可用、表单说不可添加"的自相矛盾。
 //
 // 分类判定全部在 `catalogTree.ts` 里（纯函数、可单测）；本文件不写任何
 // `variable_id` 前缀判断，也不认识 `cnc_variable` 之外的世界。
@@ -20,6 +24,7 @@ import {
   type CatalogTreeDefinitionLike,
   type CatalogTreeItem,
 } from "../catalogTree";
+import { AVAILABILITY_TAG_COLOR } from "../definitionMeta";
 
 export interface CatalogCategoryTreeProps<T extends CatalogTreeDefinitionLike> {
   /** 待建树条目（父层已完成 scope 等准入过滤；本组件只负责分类导航）。 */
@@ -154,6 +159,13 @@ export function CatalogCategoryTree<T extends CatalogTreeDefinitionLike>({
   );
 }
 
+/**
+ * 一个叶子：名称 + 变量 ID + 单位 + 可用性（四态不同颜色）+ 手册位置（tooltip）。
+ *
+ * 这里刻意把 sidecar 的四块都放在**叶子自身**上：用户不需要先选中变量才知道
+ * "它有没有单位、能不能采"，否则 `hold` / `reference_only` 的条目看起来和可采条目
+ * 一模一样，点进去才被拒。
+ */
 function ItemRow<T extends CatalogTreeDefinitionLike>({
   item,
   selected,
@@ -166,6 +178,10 @@ function ItemRow<T extends CatalogTreeDefinitionLike>({
   onSelect: (variableId: string) => void;
 }) {
   const unknown = !item.categoryKnown;
+  // sidecar 四块：单位 / 可用性 / 手册位置。判定与文案全部来自 `definitionMeta`
+  // （树上与表单读同一份结论），本组件只负责排版，不做任何二次推断。
+  const { unit, availability, manualLocation } = item.meta;
+  const unitVerified = unit.status === "verified";
   return (
     <button
       type="button"
@@ -173,12 +189,14 @@ function ItemRow<T extends CatalogTreeDefinitionLike>({
       data-category={item.bucket}
       data-category-known={item.categoryKnown ? "true" : "false"}
       data-selected={selected ? "true" : "false"}
+      data-availability={availability.state}
       disabled={disabled || item.variableId === ""}
       onClick={() => onSelect(item.variableId)}
       style={{
         display: "flex",
         alignItems: "baseline",
         gap: 6,
+        flexWrap: "wrap",
         textAlign: "left",
         background: selected ? "#e6f4ff" : "none",
         border: "none",
@@ -194,6 +212,65 @@ function ItemRow<T extends CatalogTreeDefinitionLike>({
         {catalogItemLabel(item.definition) || item.variableId}
       </span>
       <span style={{ fontSize: 10, color: "#8c8c8c", flexShrink: 0 }}>{item.variableId}</span>
+      {/*
+        单位：只有 `unit.status === "verified"` 且确有取值才显示真实单位；
+        其余一律显示"单位未核实"——空白会被读成"没有单位"，假单位更糟。
+      */}
+      <span
+        data-testid={`catalog-tree-leaf-unit-${item.variableId}`}
+        data-unit-status={unit.status}
+        title={unit.hint}
+        style={{
+          fontSize: 10,
+          flexShrink: 0,
+          color: unitVerified ? "#262626" : "#8c8c8c",
+          fontStyle: unitVerified ? "normal" : "italic",
+        }}
+      >
+        {unit.label}
+      </span>
+      {/*
+        可用性：四态各有不同颜色 + 文案，未声明/非法单列成"可用性未知"（fail-closed）。
+        颜色只是辅助，`data-availability` 与文案才是可断言的判据。
+      */}
+      <Tag
+        data-testid={`catalog-tree-leaf-availability-${item.variableId}`}
+        data-availability={availability.state}
+        color={AVAILABILITY_TAG_COLOR[availability.state]}
+        style={{ fontSize: 10, lineHeight: "16px", marginInlineEnd: 0, flexShrink: 0 }}
+      >
+        {availability.shortLabel}
+      </Tag>
+      {/*
+        `hold` 必须能直接看见原因：给一行小字（11px、次要色）而不是只放在 tooltip 里，
+        保证"为什么不能采"不需要鼠标悬停就能读到；仍不抢主视觉。
+      */}
+      {availability.state === "hold" ? (
+        <span
+          data-testid={`catalog-tree-leaf-hold-reason-${item.variableId}`}
+          title={availability.hint}
+          style={{ fontSize: 10, color: "#c62828", flexShrink: 0 }}
+        >
+          暂缓原因：{availability.reasonZh ?? "驱动未给出原因"}
+        </span>
+      ) : null}
+      {/*
+        手册位置（页码 / 章节）只在 tooltip 与 data 属性里可查：它是溯源信息，
+        不该占主视觉；缺失时整块不渲染（不显示假页码）。
+      */}
+      {manualLocation.label ? (
+        <Tooltip title={manualLocation.hint}>
+          <span
+            data-testid={`catalog-tree-leaf-manual-${item.variableId}`}
+            data-page={manualLocation.page ?? ""}
+            data-section={manualLocation.section ?? ""}
+            data-document={manualLocation.documentNumber ?? ""}
+            style={{ fontSize: 10, color: "#8c8c8c", flexShrink: 0, cursor: "help" }}
+          >
+            手册
+          </span>
+        </Tooltip>
+      ) : null}
       {unknown ? (
         <Tag
           color="orange"

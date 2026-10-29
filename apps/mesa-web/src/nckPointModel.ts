@@ -34,6 +34,16 @@ export interface NckDefinitionLike extends NckVariableDefinitionLike {
   category?: unknown;
   /** 分类依据（本轮恒为 `"navigation_rule"`；同样按 unknown 读取，展示原文）。 */
   category_basis?: unknown;
+  /**
+   * 四块 sidecar 元数据（`unit` / `manual_location` / `index_rule` / `availability`）。
+   *
+   * 一律 `unknown`：形状与取值都是**后端数据**，容错与判据只在 `definitionMeta.ts`
+   * 里写一次。`availability` 缺失/非法 ⇒ 门禁 fail-closed（不是默认放行）。
+   */
+  unit?: unknown;
+  manual_location?: unknown;
+  index_rule?: unknown;
+  availability?: unknown;
   semantics_status?: unknown;
   source?: unknown;
   targets?: unknown;

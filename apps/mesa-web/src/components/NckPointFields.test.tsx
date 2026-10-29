@@ -15,6 +15,7 @@ import type { NckIdentityPreviewResponse } from "../nckCatalog";
 import type { NckDefinitionLike } from "../nckPointModel";
 import type { NckPointSelection } from "../deviceModel";
 import type { SchemaDescriptor } from "../types";
+import { CANDIDATE_AVAILABILITY } from "../test/availabilityFixture";
 
 function definition(overrides: Partial<NckDefinitionLike> = {}): NckDefinitionLike {
   return {
@@ -27,6 +28,7 @@ function definition(overrides: Partial<NckDefinitionLike> = {}): NckDefinitionLi
     targets: ["channel"],
     target_required: ["channel"],
     arguments: [],
+    availability: CANDIDATE_AVAILABILITY,
     identity_template: "syn.channel.status@channel={channel}",
     identity_keys: [{ path: "channel", required: true }],
     golden_ref: [{ entry: "nc_variable" }],
