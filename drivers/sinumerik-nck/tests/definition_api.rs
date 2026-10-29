@@ -358,12 +358,9 @@ async fn latest_catalog_uses_revision_two_but_exact_revision_one_remains_availab
     assert_eq!(row["category"], "machine_data");
     assert_eq!(row["category_basis"], "definition");
     assert_eq!(row["semantics_status"], "candidate");
-    assert!(
-        !row["source"].as_array().unwrap().iter().any(|s| {
-            s["kind"] == "measurement"
-                && s["reference"] == "docs/evidence/nck-live-identity-probe.txt"
-        })
-    );
+    assert!(!row["source"].as_array().unwrap().iter().any(|s| {
+        s["kind"] == "measurement" && s["reference"] == "docs/evidence/nck-live-identity-probe.txt"
+    }));
 
     let historical = catalog_json(json!({
         "variable_id": "axis.encoder.module_number",

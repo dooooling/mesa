@@ -62,7 +62,10 @@ fn revision_two_categories_are_persisted_in_definition_data() {
     assert_eq!(defs.len(), 42);
     for def in defs {
         assert_eq!(def["revision"], 2);
-        assert!(def.get("digest").is_none(), "digest belongs in DIGESTS.lock, not the definition document");
+        assert!(
+            def.get("digest").is_none(),
+            "digest belongs in DIGESTS.lock, not the definition document"
+        );
         assert!(matches!(
             def["category"].as_str(),
             Some(
