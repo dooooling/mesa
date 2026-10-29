@@ -21,9 +21,13 @@ fn revision_one_remains_immutable_historical_evidence() {
     let def = find_definition(&catalog, "axis.encoder.module_number");
     assert_eq!(def["revision"], 1);
     assert_eq!(def["semantics_status"], "verified");
-    assert!(def["source"].as_array().unwrap().iter().any(|s| {
-        s["kind"] == "measurement" && s["reference"] == CITED_EVIDENCE_FILE
-    }));
+    assert!(
+        def["source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| { s["kind"] == "measurement" && s["reference"] == CITED_EVIDENCE_FILE })
+    );
 }
 
 #[test]
@@ -33,24 +37,40 @@ fn current_revision_removes_unsupported_measurement_claim() {
     assert_eq!(def["revision"], 2);
     assert_eq!(def["semantics_status"], "candidate");
     assert_eq!(def["category"], "machine_data");
-    assert!(!def["source"].as_array().unwrap().iter().any(|s| {
-        s["kind"] == "measurement" && s["reference"] == CITED_EVIDENCE_FILE
-    }));
-    assert!(def["source"].as_array().unwrap().iter().any(|s| {
-        s["kind"] == "identity_probe"
-    }));
+    assert!(
+        !def["source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| { s["kind"] == "measurement" && s["reference"] == CITED_EVIDENCE_FILE })
+    );
+    assert!(
+        def["source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["kind"] == "identity_probe")
+    );
 }
 
 #[test]
 fn revision_two_categories_are_persisted_in_definition_data() {
     let catalog: Value = serde_json::from_str(R2_JSON).expect("r2.json must be valid");
-    let defs = catalog["definitions"].as_array().expect("definitions array");
+    let defs = catalog["definitions"]
+        .as_array()
+        .expect("definitions array");
     assert_eq!(defs.len(), 42);
     for def in defs {
         assert_eq!(def["revision"], 2);
         assert!(matches!(
             def["category"].as_str(),
-            Some("cnc_variable" | "system_variable" | "machine_data" | "drive_parameter" | "unclassified")
+            Some(
+                "cnc_variable"
+                    | "system_variable"
+                    | "machine_data"
+                    | "drive_parameter"
+                    | "unclassified"
+            )
         ));
     }
 }
