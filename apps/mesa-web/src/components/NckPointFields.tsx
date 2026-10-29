@@ -99,6 +99,8 @@ export interface NckPointFieldsProps {
   takenPointKeys: string[];
   /** 编辑已有语义点位时的初始值（仍必须重新走服务端预览）。 */
   initialPoint?: NckPointSelection | null;
+  /** 完整定义历史（含旧 revision），仅用于精确恢复已保存点位；树仍只显示最新定义。 */
+  definitionHistory?: NckDefinitionLike[];
   /**
    * NCK Descriptor 的 `variable` 资源 Schema（12 原生字段）。
    * 提供时才显示「高级原生配置」页；缺失即不提供 native 入口（fail-closed）。
@@ -145,6 +147,7 @@ export function NckPointFields({
   definitions,
   takenPointKeys,
   initialPoint,
+  definitionHistory = [],
   nativeSchema,
   endpointId,
   probeGate,
@@ -168,10 +171,22 @@ export function NckPointFields({
   const [selectedId, setSelectedId] = useState(initialVariableId);
   // P1-1：36 个变量只用一个搜索框过滤（不新建分类体系）。支持中文名称与 ID。
   const [query, setQuery] = useState("");
-  const definition = useMemo(
-    () => definitions.find((d) => d.variable_id === selectedId) ?? null,
-    [definitions, selectedId],
-  );
+  const definition = useMemo(() => {
+    // 编辑已有点位时必须按其保存的 definition_revision 精确恢复；不能用最新版本
+    // 覆盖旧参数。新选变量仍从父层提供的最新版本列表中选择。
+    const savedRevision = initialPoint?.parameters?.definition_revision;
+    if (
+      initialPoint &&
+      selectedId === initialVariableId &&
+      typeof savedRevision === "number"
+    ) {
+      const historical = definitionHistory.find(
+        (d) => d.variable_id === selectedId && d.revision === savedRevision,
+      );
+      if (historical) return historical;
+    }
+    return definitions.find((d) => d.variable_id === selectedId) ?? null;
+  }, [definitions, definitionHistory, selectedId, initialPoint, initialVariableId]);
   // 即使父层传入全量目录，组件层也只**提供** collect 条目（A13 双执行）；
   // definition 查找仍用全量，以便身份复核能显示具体 scope 原因。
   const selectableDefinitions = useMemo(
@@ -194,7 +209,7 @@ export function NckPointFields({
   const initialModel = useMemo(
     () =>
       buildNckFormModel(
-        definitions.find((d) => d.variable_id === initialVariableId) ?? null,
+        definition,
       ),
     // 初始模型只在挂载时用于回填；后续切换变量由 handleSelect 重建草稿。
     // eslint-disable-next-line react-hooks/exhaustive-deps
