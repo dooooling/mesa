@@ -94,6 +94,7 @@ import {
   validateNativePoint,
 } from "../nckNativeModel";
 import { applySelectionAdd } from "../resourceSelectionModel";
+import { objectProbeGate } from "../objectProbe";
 import type { ApplyResult } from "./ApplyWithRestart";
 import { NckPointFields } from "./NckPointFields";
 import { ResourceBrowseAntd } from "./ResourceBrowseAntd";
@@ -384,6 +385,26 @@ export function EndpointAcquisitionPane({
   // Browse → 语义表单的预填（A1/A16 的入口）。preview_point_key 不参与提交。
   const [browseOpen, setBrowseOpen] = useState(false);
   const [browsePreset, setBrowsePreset] = useState<NckPointSelection | null>(null);
+  // Browse 语义叶带来的 `identity.keys`（驱动在 wire 上声明"还需要哪类实例"）。
+  // 只作为「选择实际对象」的需求来源之一（与定义 targets 取并集，均为数据）。
+  const [browseIdentityKeys, setBrowseIdentityKeys] = useState<unknown>(null);
+
+  /**
+   * 「选择实际对象」探测入口的可用性。
+   *
+   * 判据：端点存在（清单可读）+ 连接配置可读（family 可读）。任一不成立都不允许
+   * 发起在线探测——探测会临时拉起驱动进程读真机，连接未就绪时发起只会得到误导性
+   * 失败（评审硬要求：未连接端点不得在线探测，须明确提示"需先创建并连接端点"）。
+   */
+  const probeGate = useMemo(
+    () =>
+      objectProbeGate({
+        endpointId,
+        endpointKnown: endpointFamilyState === "ready",
+        connectionKnown: !!endpointFamily,
+      }),
+    [endpointId, endpointFamilyState, endpointFamily],
+  );
 
   // ---- 紧凑列表：搜索 / 筛选 / 分页（§2.7） ------------------------------
   const [page, setPage] = useState(1);
@@ -731,6 +752,7 @@ export function EndpointAcquisitionPane({
     setFormVersion(0);
     setBrowseOpen(false);
     setBrowsePreset(null);
+    setBrowseIdentityKeys(null);
     // 列表/搜索/分页与抽屉：切换连接后回到第 1 页、清空搜索与筛选。
     setPage(1);
     setPageSize(25);
@@ -1049,6 +1071,7 @@ export function EndpointAcquisitionPane({
     setEditingIndex(null);
     setEditingSelIndex(null);
     setBrowsePreset(null);
+    setBrowseIdentityKeys(null);
     setFormVersion((v) => v + 1);
     setDrawerDirty(false);
     setDrawerOpen(true);
@@ -2575,6 +2598,9 @@ export function EndpointAcquisitionPane({
                         point_key: "",
                         parameters: sel.parameters,
                       });
+                      // 只取 wire 的 identity.keys（"还需要哪类实例"）；preview_point_key
+                      // 仅展示，不进提交载荷。
+                      setBrowseIdentityKeys(sel.identity?.keys ?? null);
                       setEditingIndex(null);
                       setFormVersion((v) => v + 1);
                       message.info("已把浏览叶带入语义表单：请等待服务端预览确认身份");
@@ -2595,6 +2621,8 @@ export function EndpointAcquisitionPane({
                   takenPointKeys={takenPointKeys(editingIndex)}
                   initialPoint={nckPoints[editingIndex]}
                   nativeSchema={nativeSchema}
+                  endpointId={endpointId}
+                  probeGate={probeGate}
                   submitLabel="确认修改"
                   onDirtyChange={setDrawerDirty}
                   onCancel={requestCloseDrawer}
@@ -2616,6 +2644,10 @@ export function EndpointAcquisitionPane({
                   takenPointKeys={takenPointKeys(null)}
                   initialPoint={browsePreset}
                   nativeSchema={nativeSchema}
+                  // 「选择实际对象」：只有已创建且连接可读的端点才允许按需探测。
+                  endpointId={endpointId}
+                  probeGate={probeGate}
+                  objectIdentityKeys={browsePreset ? browseIdentityKeys : null}
                   submitLabel="加入待保存列表"
                   onDirtyChange={setDrawerDirty}
                   onSubmit={addPoint}
