@@ -14,6 +14,7 @@ import {
   semanticPointKey,
   type AcquisitionFixture238,
 } from "../test/acquisitionFixture238";
+import { selectVariableViaTreeWith } from "../test/catalogTreePick";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-238";
@@ -168,10 +169,7 @@ describe("验收 6/8：变更摘要措辞与「抵消 / 恢复原值」", () => 
 
     // 新增一个语义点位 → 计数「新增 1」，新行标记「新增」。
     await user.click(screen.getByTestId("add-point-entry"));
-    await user.selectOptions(
-      (await screen.findByTestId("nck-variable-select")) as HTMLSelectElement,
-      "channel.feed.actual",
-    );
+    await selectVariableViaTreeWith(user, "channel.feed.actual");
     await user.type(screen.getByLabelText("target-channel"), "4");
     await screen.findByTestId("nck-point-key");
     await user.click(screen.getByTestId("nck-add-point"));
@@ -200,8 +198,8 @@ describe("验收 10：未实现入口不出现（声明了 import 也不渲染�
     renderPane();
     await waitAllVerified(state.fixture.points.length);
     await user.click(screen.getByTestId("add-point-entry"));
-    // 变量选择入口（语义点位）在抽屉里；导入不出现（不是置灰占位）。
-    await screen.findByTestId("nck-variable-select");
+    // 变量选择入口（语义点位）在抽屉里：唯一入口是搜索框 + 分类树。
+    await screen.findByTestId("catalog-tree");
     expect(screen.queryByText("导入")).toBeNull();
     expect(screen.queryByRole("tab", { name: "导入" })).toBeNull();
     // 浏览入口只由「驱动声明」+「产品实现」共同决定（NCK 已实现 browse）。
@@ -233,10 +231,7 @@ describe("抽屉：未确认修改关闭时提醒一次（草稿生命周期）"
     await waitAllVerified(state.fixture.points.length);
 
     await user.click(screen.getByTestId("add-point-entry"));
-    await user.selectOptions(
-      (await screen.findByTestId("nck-variable-select")) as HTMLSelectElement,
-      "channel.feed.actual",
-    );
+    await selectVariableViaTreeWith(user, "channel.feed.actual");
     await user.type(screen.getByLabelText("target-channel"), "7");
     await screen.findByTestId("nck-point-key");
 
@@ -246,12 +241,12 @@ describe("抽屉：未确认修改关闭时提醒一次（草稿生命周期）"
     expect(title.length).toBeGreaterThan(0);
     // 「继续编辑」⇒ 抽屉仍然开着，输入还在。
     await user.click(screen.getByRole("button", { name: "继续编辑" }));
-    expect(screen.getByTestId("nck-variable-select")).toBeTruthy();
+    expect(screen.getByTestId("catalog-tree")).toBeTruthy();
 
     // 「放弃修改」⇒ 抽屉关闭，且没有写入草稿（无点位变更、无写请求）。
     await user.click(screen.getByTestId("drawer-cancel"));
     await user.click(await screen.findByRole("button", { name: "放弃修改" }));
-    await waitFor(() => expect(screen.queryByTestId("nck-variable-select")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("catalog-tree")).toBeNull());
     expect(screen.queryByTestId("draft-save-bar")).toBeNull();
     expect(state.putBodies).toHaveLength(0);
   }, 30_000);

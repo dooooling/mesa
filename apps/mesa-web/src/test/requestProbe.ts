@@ -15,6 +15,15 @@ import { vi } from "vitest";
 export type ProbeCall =
   | "GET:endpoints"
   | "GET:descriptor"
+  /** I-2 定义目录（`/drivers/{id}/definitions`，可多页）。 */
+  | "GET:definitions"
+  /**
+   * 对象探测（`POST /endpoints/{id}/browse`）。
+   *
+   * 单列一个标签而不是并入 OTHER：探测会临时拉起驱动进程读真机，"是否发了探测"
+   * 与"按什么顺序发"本身就是验收条件（未连接端点必须零探测、探测早于预览）。
+   */
+  | "BROWSE"
   | "GET:tasks"
   | "PUT:tasks"
   | "STOP"
@@ -33,7 +42,10 @@ export function classifyRequest(url: string, method?: string): ProbeCall {
   if (url === "/api/v1/endpoints") return "GET:endpoints";
   if (url.startsWith("/api/v1/devices")) return "OTHER";
   if (url.endsWith("/definitions/identity-preview")) return "PREVIEW";
+  // 目录分页请求与预览同前缀：预览已在上一条分流，这里只剩目录本体。
+  if (m === "GET" && url.includes("/definitions")) return "GET:definitions";
   if (url.startsWith("/api/v1/drivers/")) return "GET:descriptor";
+  if (m === "POST" && url.endsWith("/browse")) return "BROWSE";
   if (url.startsWith("/api/v1/tasks?endpoint=")) return "GET:tasks";
   if (m === "PUT" && url.startsWith("/api/v1/tasks/")) return "PUT:tasks";
   if (m === "POST" && url.endsWith("/stop")) return "STOP";

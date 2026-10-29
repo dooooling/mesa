@@ -280,6 +280,10 @@ async fn definitions_returns_42_rows_with_digests() {
 }
 
 /// I2：每行是 `r1.json` 的**逐字投影**，且键集合恰为白名单（无原生字段）。
+///
+/// NOTE(导航字段)：键集合比 `r1.json` 多 `category` / `category_basis` 两个**投影期
+/// 计算**的导航字段（见 `catalog_category.rs`）。它们不是定义字段，因此只出现在
+/// 键集合与下方"逐字一致"循环之外——后者仍然逐条比对 13 个 `r1.json` 字段。
 #[tokio::test]
 async fn definitions_payload_is_verbatim_projection() {
     let whitelist: BTreeSet<&str> = [
@@ -297,6 +301,8 @@ async fn definitions_payload_is_verbatim_projection() {
         "identity_keys",
         "golden_ref",
         "digest",
+        "category",
+        "category_basis",
     ]
     .into_iter()
     .collect();

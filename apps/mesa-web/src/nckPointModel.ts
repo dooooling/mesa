@@ -25,6 +25,15 @@ export interface NckDefinitionLike extends NckVariableDefinitionLike {
   revision?: number;
   family?: string;
   label?: string | { zh?: string; en?: string };
+  /**
+   * 导航分类（`definition_api.rs:571-576` 的投影期附加字段）。
+   *
+   * 取 `unknown` 而不是联合类型：这是**后端数据**，前端只允许逐字采用或落"待分类"，
+   * 不做联合类型归一化（否则非法取值会被 TypeScript 掩盖成"合法分类"）。
+   */
+  category?: unknown;
+  /** 分类依据（本轮恒为 `"navigation_rule"`；同样按 unknown 读取，展示原文）。 */
+  category_basis?: unknown;
   semantics_status?: unknown;
   source?: unknown;
   targets?: unknown;

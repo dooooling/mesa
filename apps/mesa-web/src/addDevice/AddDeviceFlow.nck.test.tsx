@@ -3,6 +3,7 @@ import { act, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invokeDisabledButton } from "../test/bypassDisabled";
 import { renderAddDeviceFlow as renderFlow } from "../test/addDeviceFlowHarness";
+import { selectVariableViaTreeWith } from "../test/catalogTreePick";
 
 beforeEach(() => {
   vi.useRealTimers();
@@ -245,13 +246,8 @@ async function addSemanticPoint(
   channel = "1",
   variableId = "syn.collect.a",
 ) {
-  await waitFor(() =>
-    expect(screen.getByTestId("nck-variable-select")).toBeTruthy(),
-  );
-  await user.selectOptions(
-    screen.getByTestId("nck-variable-select") as HTMLSelectElement,
-    variableId,
-  );
+  await waitFor(() => expect(screen.getByTestId("catalog-tree")).toBeTruthy());
+  await selectVariableViaTreeWith(user, variableId);
   const input = screen.getByLabelText("target-channel");
   await user.clear(input);
   await user.type(input, channel);
@@ -302,7 +298,9 @@ describe("PR-D D1–D3：NCK 数据步只提供语义入口", () => {
     await screen.findByTestId("nck-catalog-meta");
 
     expect(screen.getByTestId("nck-semantic-picker")).toBeTruthy();
-    expect(screen.getByTestId("nck-variable-select")).toBeTruthy();
+    // 变量选择入口 = 搜索框 + 分类树（平铺下拉框已按评审要求移除）。
+    expect(screen.getByTestId("nck-variable-search")).toBeTruthy();
+    expect(screen.getByTestId("catalog-tree")).toBeTruthy();
     // 旧通用 Picker 的手动页整体不渲染：无「手动」Tab、无 output 复选框、无「无可用资源」。
     expect(screen.queryByRole("tab", { name: "手动" })).toBeNull();
     expect(screen.queryByRole("checkbox", { name: "output-value" })).toBeNull();
@@ -366,10 +364,7 @@ describe("PR-D D4–D5：目录先于 Endpoint、family 取自连接草稿", () 
       family: "828d",
     });
     await screen.findByTestId("nck-catalog-meta");
-    await user.selectOptions(
-      screen.getByTestId("nck-variable-select") as HTMLSelectElement,
-      "syn.collect.a",
-    );
+    await selectVariableViaTreeWith(user, "syn.collect.a");
     await user.type(screen.getByLabelText("target-channel"), "1");
     await screen.findByTestId("nck-family-reject");
     expect(screen.getByTestId("nck-family-reject").textContent).toContain("FAMILY_MISMATCH");
@@ -393,10 +388,7 @@ describe("PR-D D4–D5：目录先于 Endpoint、family 取自连接草稿", () 
     await screen.findByTestId("nck-catalog-meta");
     expect(screen.getByTestId("nck-family-missing")).toBeTruthy();
 
-    await user.selectOptions(
-      screen.getByTestId("nck-variable-select") as HTMLSelectElement,
-      "syn.collect.a",
-    );
+    await selectVariableViaTreeWith(user, "syn.collect.a");
     await user.type(screen.getByLabelText("target-channel"), "1");
     await screen.findByTestId("nck-family-reject");
     expect(screen.getByTestId("nck-family-reject").textContent).toContain(

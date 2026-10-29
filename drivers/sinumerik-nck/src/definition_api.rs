@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use mesa_core_types::ErrorKind;
 use serde_json::{Map, Value};
 
+use crate::catalog_category::classify_category;
 use crate::compiler::{AddressCompiler, CompileError};
 use crate::definition::{
     CatalogError, DEFINITION_FORMAT_VERSION, DefinitionCatalog, DefinitionScope,
@@ -54,6 +55,11 @@ const PREVIEW_KEYS: [&str; 3] = ["family", "kind", "parameters"];
 /// 为什么不含 `unit`：它属原生字段白名单（`compiler.rs:45-58`）的一员，是原生
 /// 侧展示注解而非语义可见面；当前 42 条定义均未声明它（`r1.json` 实测 0 条），
 /// 因此排除它**不改变**今天的投影结果。
+///
+/// NOTE(投影期附加字段)：`category` / `category_basis` **不在此白名单内**——它们
+/// 不是定义字段（`r1.json` 里没有、也不会有，见 `catalog_category.rs` 的模块
+/// 文档），而是投影期由驱动侧导航规则算出来的附加字段。因此它们既不参与
+/// 「逐字投影」的比对，也绝不可能回写定义/摘要。
 const PROJECTED_KEYS: [&str; 14] = [
     "variable_id",
     "revision",
@@ -532,6 +538,13 @@ fn published_families(catalog: &DefinitionCatalog) -> BTreeSet<String> {
 }
 
 /// 单条定义的**语义可见面**投影（白名单 + 逐字取值，唯一例外是装载期计算的 `digest`）。
+///
+/// 另外附加两个**导航字段**（不改变任何既有字段的语义与形状）：
+/// - `category`：前端建树用的分类码（`cnc_variable` / `system_variable` /
+///   `machine_data` / `drive_parameter` / `unclassified`）；
+/// - `category_basis`：该分类的依据，本轮恒为 `"navigation_rule"`——即「这是驱动侧
+///   临时导航规则，不是手册确认的分类」。方案 B（正式定义修订）后才允许变为
+///   `"definition"`。详见 `catalog_category.rs` 的模块文档。
 fn project(def: &VariableDefinition) -> Result<Value, DefinitionApiError> {
     let full = serde_json::to_value(def).map_err(|e| {
         DefinitionApiError::internal(
@@ -555,6 +568,11 @@ fn project(def: &VariableDefinition) -> Result<Value, DefinitionApiError> {
         })?;
         out.insert(key.to_string(), value.clone());
     }
+    // 导航分类（附加字段，见函数文档）：`category_basis` 是自证字段，取值本轮
+    // **恒为** `navigation_rule`，让任何消费者都能看出这不是手册事实。
+    let assignment = classify_category(def);
+    out.insert("category".into(), Value::from(assignment.category.as_str()));
+    out.insert("category_basis".into(), Value::from(assignment.basis));
     Ok(Value::Object(out))
 }
 

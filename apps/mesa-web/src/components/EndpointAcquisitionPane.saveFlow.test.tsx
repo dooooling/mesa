@@ -9,6 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { message } from "antd";
 import { EndpointAcquisitionPane, type NckDefinitionMap } from "./EndpointAcquisitionPane";
 import { NCK_POINTS_KIND, type AcquisitionTaskShape, type NckPointSelection } from "../deviceModel";
+import { selectVariableViaTreeWith } from "../test/catalogTreePick";
 
 const NCK_DRIVER = "sinumerik-nck";
 const EP = "ep-flow";
@@ -330,10 +331,7 @@ describe("交付 3：稳定 rowId（编辑/删除/新增后同一行身份不变
 
     // 3) 新增一行：发新号，且不复用被删除的 initial[0]。
     await user.click(screen.getByTestId("add-point-entry"));
-    await user.selectOptions(
-      (await screen.findByTestId("nck-variable-select")) as HTMLSelectElement,
-      "syn.collect.a",
-    );
+    await selectVariableViaTreeWith(user, "syn.collect.a");
     await user.type(screen.getByLabelText("target-channel"), "5");
     await screen.findByTestId("nck-point-key");
     await user.click(screen.getByTestId("nck-add-point"));

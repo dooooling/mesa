@@ -87,6 +87,22 @@ export interface NckCatalogDefinition {
   identity_keys: NckCatalogIdentityKey[];
   golden_ref: NckCatalogGoldenRef[];
   digest: string;
+  /**
+   * 导航分类（**投影期附加字段**，不进 digest、不改定义结构）。
+   *
+   * 五码之一：`cnc_variable` / `system_variable` / `machine_data` /
+   * `drive_parameter` / `unclassified`（drivers/sinumerik-nck/src/catalog_category.rs）。
+   * 缺失按"分类未知"处理——**不拒绝整页响应**：分类是导航用的附加信息，
+   * 与 14 字段白名单的"缺一个即整体拒绝"不同（缺了它仍然能采，只是无法建树）。
+   */
+  category?: string | null;
+  /**
+   * 分类依据的自证标记（本轮恒为 `"navigation_rule"`）。
+   *
+   * 它说明 `category` 是**驱动侧为建树临时制定的导航规则**，不是手册确认的分类；
+   * UI 必须展示或可查（见 `catalogTree.describeCategoryBasis`）。
+   */
+  category_basis?: string | null;
 }
 
 /** I-2 目录响应：**10 字段分页信封**（definition_api.rs:260-282）。 */
@@ -376,6 +392,20 @@ function parseDefinitionEntry(value: unknown, index: number): NckCatalogDefiniti
   if (!Array.isArray(goldenRef)) throw contractError(`${where}.golden_ref 必须是数组`);
   const digest = need("digest");
   if (typeof digest !== "string") throw contractError(`${where}.digest 必须是字符串`);
+  // 分类两个字段是**附加**信息：存在时必须合法（字符串或 null），缺失则留空。
+  // 不做"缺失即整页拒绝"：分类只影响建树导航，缺它不影响采集能力（见类型注释）。
+  const category = value.category;
+  if (category !== undefined && category !== null && typeof category !== "string") {
+    throw contractError(`${where}.category 必须是字符串或 null`);
+  }
+  const categoryBasis = value.category_basis;
+  if (
+    categoryBasis !== undefined &&
+    categoryBasis !== null &&
+    typeof categoryBasis !== "string"
+  ) {
+    throw contractError(`${where}.category_basis 必须是字符串或 null`);
+  }
   return {
     variable_id: variableId,
     revision,
@@ -391,6 +421,10 @@ function parseDefinitionEntry(value: unknown, index: number): NckCatalogDefiniti
     identity_keys: identityKeys as NckCatalogIdentityKey[],
     golden_ref: goldenRef as NckCatalogGoldenRef[],
     digest,
+    ...(category !== undefined && category !== null ? { category } : {}),
+    ...(categoryBasis !== undefined && categoryBasis !== null
+      ? { category_basis: categoryBasis }
+      : {}),
   };
 }
 

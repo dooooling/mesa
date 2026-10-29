@@ -15,6 +15,7 @@ import userEvent from "@testing-library/user-event";
 import { message } from "antd";
 import { EndpointAcquisitionPane } from "./EndpointAcquisitionPane";
 import { invokeDisabledButton } from "../test/bypassDisabled";
+import { catalogLeafIds, selectVariableViaTreeWith, selectedCatalogLeafIds } from "../test/catalogTreePick";
 import { UNSUPPORTED_CONFIG_NOTICE } from "../descriptorCompatibility";
 import {
   CANONICAL_RESOURCES_KIND,
@@ -238,10 +239,10 @@ async function waitVerified(count = 1) {
   );
 }
 
-/** 打开添加抽屉并等待里面的选择入口就绪。 */
+/** 打开添加抽屉并等待里面的选择入口就绪（搜索框 + 分类树）。 */
 async function openAddDrawer(user: ReturnType<typeof userEvent.setup>) {
   await user.click(await screen.findByTestId("add-point-entry"));
-  await screen.findByTestId("nck-variable-select");
+  await screen.findByTestId("catalog-tree");
 }
 
 /** 制造一次真实变更，让固定保存区出现。 */
@@ -306,13 +307,12 @@ describe("门禁 1/3：目录分页完整读取，仅 collect 进入采集界面
     // 两页都读了：cursor 逐字回传。
     expect(state.catalogCalls).toHaveLength(2);
     expect(state.catalogCalls[1]).toContain("cursor=v1-syn.collect.b-1");
-    const options = Array.from(
-      (screen.getByTestId("nck-variable-select") as HTMLSelectElement).querySelectorAll("option"),
-    ).map((o) => o.value);
-    expect(options).toContain("syn.collect.a");
-    expect(options).toContain("syn.collect.b");
+    // 树上可见叶子 = 可提供的变量集合（原「下拉框 option 集合」的等价口径）。
+    const leafIds = catalogLeafIds();
+    expect(leafIds).toContain("syn.collect.a");
+    expect(leafIds).toContain("syn.collect.b");
     // identity 条目不得出现在可采集选择列表（不是禁用，而是不提供）。
-    expect(options).not.toContain("syn.identity.a");
+    expect(leafIds).not.toContain("syn.identity.a");
   });
 });
 
@@ -341,7 +341,7 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
     );
     // 默认页面不常驻添加表单（§2.1）。
     await waitFor(() => expect(screen.queryByTestId("add-point-entry")).toBeTruthy());
-    expect(screen.queryByTestId("nck-variable-select")).toBeNull();
+    expect(screen.queryByTestId("catalog-tree")).toBeNull();
     // 无修改时保存区不渲染。
     expect(screen.queryByTestId("apply-button")).toBeNull();
 
@@ -352,8 +352,7 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
     );
     // 未选资源时只显示一个选择入口：没有空身份、禁用按钮与错误框的组合。
     expect(screen.queryByTestId("nck-add-point")).toBeNull();
-    const select = screen.getByTestId("nck-variable-select") as HTMLSelectElement;
-    await user.selectOptions(select, "syn.collect.a");
+    await selectVariableViaTreeWith(user, "syn.collect.a");
     await user.type(screen.getByLabelText("target-channel"), "1");
     await screen.findByTestId("nck-point-key");
     // 按钮文案是「加入待保存列表」，不是「保存点位」（§4.1-7）。
@@ -361,7 +360,7 @@ describe("门禁 7：抽屉内新增点位 → nck.points.v1 → PUT 后回读�
     await user.click(screen.getByTestId("nck-add-point"));
     await screen.findByTestId("nck-point-row");
     // 抽屉关闭（只更新草稿，不发任何写请求）。
-    await waitFor(() => expect(screen.queryByTestId("nck-variable-select")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("catalog-tree")).toBeNull());
     await waitFor(() => expect(saveButton().disabled).toBe(false));
     await user.click(saveButton());
 
@@ -441,10 +440,7 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
 
     // 在同一个 NCK 任务里新增第二个点位（抽屉入口）。
     await openAddDrawer(user);
-    await user.selectOptions(
-      screen.getByTestId("nck-variable-select") as HTMLSelectElement,
-      "syn.collect.b",
-    );
+    await selectVariableViaTreeWith(user, "syn.collect.b");
     await user.type(screen.getByLabelText("target-channel"), "2");
     await screen.findByTestId("nck-point-key");
     await user.click(screen.getByTestId("nck-add-point"));
@@ -495,7 +491,7 @@ describe("门禁 8：已有点位编辑保留合法任务，不增殖旧 Binding
 
     // 点行「编辑」→ 抽屉立即打开并带入配置；确认按钮是「确认修改」。
     await user.click(within(rowOf(original.point_key)).getByTestId("point-row-edit"));
-    await screen.findByTestId("nck-variable-select");
+    await screen.findByTestId("catalog-tree");
     expect(screen.getByTestId("nck-add-point").textContent).toBe("确认修改");
     const input = screen.getByLabelText("target-channel") as HTMLInputElement;
     await user.clear(input);
@@ -666,10 +662,7 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
       />,
     );
     await openAddDrawer(user);
-    await user.selectOptions(
-      screen.getByTestId("nck-variable-select") as HTMLSelectElement,
-      "syn.collect.a",
-    );
+    await selectVariableViaTreeWith(user, "syn.collect.a");
     await user.type(screen.getByLabelText("target-channel"), "1");
     await screen.findByTestId("nck-point-key");
 
@@ -682,9 +675,10 @@ describe("收口回归：切换 Endpoint 不得残留上一台的表单/Preview"
       />,
     );
     // 切换 Endpoint 必须关闭抽屉并重建表单：上一台的目标输入与已确认 Key 不得残留。
-    await waitFor(() => expect(screen.queryByTestId("nck-variable-select")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("catalog-tree")).toBeNull());
     await openAddDrawer(user);
-    expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe("");
+    // 重建后的表单未选中任何变量（树上没有任何叶子处于选中态）。
+    expect(selectedCatalogLeafIds()).toEqual([]);
     expect(screen.queryByTestId("nck-point-key")).toBeNull();
     // 未重新选择变量 ⇒ 不渲染任何 Target 输入（上一台的输入已随卸载丢弃）。
     expect(screen.queryByLabelText("target-channel")).toBeNull();
@@ -989,11 +983,8 @@ describe("PR-C 第三批：Endpoint 页 Browse → 语义表单（A1/A13/A16）"
     // A1/A16：collect 叶可进入语义表单；Browse 预览只展示，提交前重新 Preview。
     const collectRow = screen.getByText("Browse 程序状态").closest("div") as HTMLElement;
     await user.click(within(collectRow).getByRole("button", { name: /选用（语义）/ }));
-    await waitFor(() =>
-      expect((screen.getByTestId("nck-variable-select") as HTMLSelectElement).value).toBe(
-        "syn.collect.a",
-      ),
-    );
+    // 语义表单里的「已选变量」由树上叶子的选中态体现（平铺下拉框已移除）。
+    await waitFor(() => expect(selectedCatalogLeafIds()).toEqual(["syn.collect.a"]));
     expect((screen.getByLabelText("target-channel") as HTMLInputElement).value).toBe("1");
     await screen.findByTestId("nck-point-key");
     expect(screen.getByTestId("nck-point-key").textContent).toBe("syn.collect.a@channel=1");

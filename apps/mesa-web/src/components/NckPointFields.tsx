@@ -3,6 +3,17 @@
 // 这个组件只服务「语义点位（nck_variable）」；高级原生（nck_native）仍走既有
 // Descriptor 12 字段入口，不在本批改语义。
 //
+// 统一操作流程（评审 5 条落地后的形态，顺序固定）：
+//   ① 搜索或树形选择变量（`CatalogCategoryTree`，分类只读后端 `category`）
+//   → ② 需要对象实例时，按需探测并选择实际对象（`ObjectProbePanel`）
+//   → ③ 服务端 Preview 确认身份（唯一权威，前端不产生 point_key）
+//   → ④ 加入待保存列表（只进草稿，不发写请求）。
+// 高级原生参数（module/column/line…）默认折叠，普通配置优先。
+//
+// 分类只是**导航规则**：`category` 由驱动侧临时规则给出（`category_basis =
+// navigation_rule`），本组件绝不据此推断可采集性，也不按前缀自行归类；
+// 后端明确 `unclassified` 的条目按 fail-closed 拒绝提交（见 catalogTree.evaluateCategoryGate）。
+//
 // 三条不可妥协的规则：
 // 1. **point_key 唯一来源是服务端 `identity-preview`**：Browse 的
 //    `preview_point_key` 只作展示，前端模板替换不得作为可提交来源。
@@ -12,13 +23,22 @@
 // 3. **迟到响应整份丢弃**：请求序号 + 输入指纹都匹配才采纳；被丢弃的响应
 //    不得在任何文案/状态里留下痕迹。
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Button, Input, Space, Tag } from "antd";
+import { Alert, Button, Input, Space, Tag, Tooltip } from "antd";
 import type { SchemaDescriptor } from "../types";
 import type { NckPointSelection } from "../deviceModel";
 import {
   collectableDefinitions,
   evaluateNckSelectionAdd,
 } from "../nckCollectability";
+import { classifyCatalogDefinition, evaluateCategoryGate } from "../catalogTree";
+import { CatalogCategoryTree } from "./CatalogCategoryTree";
+import { ObjectProbePanel } from "./ObjectProbePanel";
+import {
+  objectProbeGate,
+  resolveObjectNeeds,
+  type ObjectFill,
+  type ObjectProbeGate,
+} from "../objectProbe";
 import {
   isNckRequestError,
   previewNckPoint,
@@ -84,6 +104,23 @@ export interface NckPointFieldsProps {
    * 提供时才显示「高级原生配置」页；缺失即不提供 native 入口（fail-closed）。
    */
   nativeSchema?: SchemaDescriptor | null;
+  /**
+   * 探测"实际对象"用的 Endpoint（缺省 ⇒ 探测入口不可用，且**不发任何请求**）。
+   *
+   * 为什么必须显式传入而不是从上下文取：探测会临时拉起驱动进程读真机，
+   * 未连接端点时发起只会得到误导性失败（评审硬要求）。
+   */
+  endpointId?: string | null;
+  /**
+   * 探测入口可用性（由父层按"端点是否已创建 + 连接配置是否可读"算好）。
+   * 缺省按"不可用"处理，并给出原因（不静默放开）。
+   */
+  probeGate?: ObjectProbeGate;
+  /**
+   * Browse 语义叶带来的 `identity.keys`（驱动在 wire 上直接声明"还需要哪类实例"）。
+   * 有它时对象需求以它为准，定义 `targets` 只作补足——两者都是数据，前端不推断。
+   */
+  objectIdentityKeys?: unknown;
   submitLabel?: string;
   onCancel?: () => void;
   onSubmit: (point: NckPointSelection) => void;
@@ -109,6 +146,9 @@ export function NckPointFields({
   takenPointKeys,
   initialPoint,
   nativeSchema,
+  endpointId,
+  probeGate,
+  objectIdentityKeys,
   submitLabel,
   onCancel,
   onSubmit,
@@ -151,18 +191,6 @@ export function NckPointFields({
       return variableId.includes(needle) || label.includes(needle) || en.includes(needle);
     });
   }, [selectableDefinitions, query]);
-  // 已选变量必须始终留在下拉里：搜索词把它过滤掉时补回首项，避免
-  // `<select value>` 找不到匹配项而视觉上变成“未选择”（状态其实还在）。
-  const visibleDefinitions = useMemo(() => {
-    if (!selectedId) return filteredDefinitions;
-    if (filteredDefinitions.some((item) => String(item.variable_id) === selectedId)) {
-      return filteredDefinitions;
-    }
-    const selected = selectableDefinitions.find(
-      (item) => String(item.variable_id) === selectedId,
-    );
-    return selected ? [selected, ...filteredDefinitions] : filteredDefinitions;
-  }, [filteredDefinitions, selectedId, selectableDefinitions]);
   const initialModel = useMemo(
     () =>
       buildNckFormModel(
@@ -176,9 +204,32 @@ export function NckPointFields({
     initialPoint ? nckDraftFromParameters(initialModel, initialPoint.parameters) : emptyNckDraft(initialModel),
   );
   const [previewState, setPreviewState] = useState<PreviewState>({ kind: "idle" });
+  // 上一次「按实际对象自动填参」的依据（可见、可核对；null = 本次没填过）。
+  // 只用于展示：填进去的值仍要过定义校验与服务端 Preview，前端不产生身份。
+  const [fillNotice, setFillNotice] = useState<{ basis: string; unresolved: string[] } | null>(
+    null,
+  );
 
   const model = useMemo(() => buildNckFormModel(definition), [definition]);
   const admission = useMemo(() => evaluateNckSelectionAdd(definition), [definition]);
+  // 分类导航（只读后端字段）：未选中 / 缺 category / 明确 unclassified 都落"待分类"，
+  // 其中**后端明确 unclassified** 的条目按 fail-closed 拒绝提交。
+  const categoryItem = useMemo(
+    () => (definition ? classifyCatalogDefinition(definition) : null),
+    [definition],
+  );
+  const categoryGate = useMemo(() => evaluateCategoryGate(categoryItem), [categoryItem]);
+  // 需要的对象类型：wire 的 identity.keys 优先，定义 targets/target_required 补足。
+  const objectNeeds = useMemo(
+    () => resolveObjectNeeds({ definition, identityKeys: objectIdentityKeys }),
+    [definition, objectIdentityKeys],
+  );
+  const resolvedProbeGate = useMemo<ObjectProbeGate>(
+    () =>
+      probeGate ??
+      objectProbeGate({ endpointId: endpointId ?? "", endpointKnown: false, connectionKnown: false }),
+    [probeGate, endpointId],
+  );
   const familyCheck = useMemo(
     () =>
       definition
@@ -310,6 +361,7 @@ export function NckPointFields({
   const keyTaken = !!currentKey && takenPointKeys.includes(currentKey);
   const canSubmit =
     !!definition &&
+    categoryGate.ok &&
     admission.ok &&
     familyCheck.ok &&
     model.ok &&
@@ -327,12 +379,31 @@ export function NckPointFields({
     // 切换变量必须清空不兼容的 Target/Arguments（A30/A31），绝不残留旧值。
     setDraft(emptyNckDraft(buildNckFormModel(nextDefinition)));
     setPreviewState({ kind: "idle" });
+    setFillNotice(null);
+  };
+
+  /**
+   * 接受「实际对象」带来的填参结果。
+   *
+   * 只覆盖载荷里**确实给出**的键：其余字段保持用户已输入/留空状态，绝不补默认值
+   * （缺项由定义校验拦住，再由服务端 Preview 复核）。填参后旧身份立即失效——
+   * `setPreviewState(idle)` 让上一份 point_key 不再可提交。
+   */
+  const applyObjectFill = (fill: ObjectFill) => {
+    setDraft((prev) => ({
+      target: { ...prev.target, ...fill.target },
+      arguments: { ...prev.arguments, ...fill.arguments },
+    }));
+    setPreviewState({ kind: "idle" });
+    setFillNotice({ basis: fill.basis, unresolved: fill.unresolved });
   };
 
   const submit = () => {
     // 不信 UI 布尔值：提交时用**实际输入**重新跑一遍全部判定。
     if (!definition) return;
     const gate = evaluateNckSelectionAdd(definition);
+    // 分类守卫同为"提交时重跑"：待分类（明确 unclassified）不得作为可采集点位。
+    const category = evaluateCategoryGate(classifyCatalogDefinition(definition));
     const family = checkNckFamily({
       endpointFamily,
       definitionFamily: definition.family,
@@ -342,6 +413,7 @@ export function NckPointFields({
     const currentValidation = validateNckForm(definition, currentModel, draft);
     const revision = typeof definition.revision === "number" ? definition.revision : null;
     if (
+      !category.ok ||
       !gate.ok ||
       !family.ok ||
       !currentModel.ok ||
@@ -376,8 +448,22 @@ export function NckPointFields({
   // 但那是“还没选”而不是“定义坏了”。只有真正选中定义后才展示输入校验问题。
   const issues = definition ? validation.issues : [];
 
+  // 高级原生配置是**折叠区**：默认停在语义（普通配置）页，原生 12 字段
+  // （area/module/column/line/decode…）只有用户主动切换才渲染。
   const modeSwitch = nativeSchema ? (
-    <div style={{ display: "flex", gap: 8, alignItems: "center" }} data-testid="nck-editor-mode">
+    <div
+      data-testid="nck-editor-mode"
+      data-native-collapsed={editorMode === "native" ? "false" : "true"}
+      style={{
+        display: "flex",
+        gap: 8,
+        alignItems: "center",
+        flexWrap: "wrap",
+        borderTop: "1px dashed #e0e0e0",
+        paddingTop: 6,
+      }}
+    >
+      <span style={{ fontSize: 11, color: "#8c8c8c" }}>高级（默认折叠）：</span>
       <Button
         size="small"
         type={editorMode === "semantic" ? "primary" : "default"}
@@ -407,45 +493,71 @@ export function NckPointFields({
     onDirtyChange?.(hasDraftInput);
   }, [hasDraftInput, onDirtyChange]);
 
-  /** 变量选择入口（搜索即列表；选中才展示定义信息）。 */
+  /**
+   * 变量选择入口：搜索（跨分类）+ 分类树。
+   *
+   * 这里刻意**只有一条**选择路径（评审要求）：搜索框过滤树中的条目，用户在树上
+   * 选中变量。历史上还并列过一个平铺的 `<select>`，它与树是同一批条目的两套入口，
+   * 只会让用户面对重复选择面，已移除；`selectedId`/`handleSelect` 仍由树驱动，
+   * 选中后的定义信息、分类标签、探测、预览与添加流程保持不变。
+   */
   const picker = (
-    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-      <span style={{ fontSize: 12 }}>变量</span>
-      <Input
-        data-testid="nck-variable-search"
-        aria-label="搜索变量"
-        placeholder="搜索变量名称或 ID"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        allowClear
-        style={{ width: 260 }}
+    <div style={{ display: "grid", gap: 6 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <span style={{ fontSize: 12 }}>变量</span>
+        <Input
+          data-testid="nck-variable-search"
+          aria-label="搜索变量"
+          placeholder="搜索变量名称或 ID（跨全部分类）"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          allowClear
+          style={{ width: 260 }}
+        />
+        {query.trim() ? (
+          <span data-testid="nck-variable-search-count" style={{ fontSize: 12, color: "#525252" }}>
+            {filteredDefinitions.length
+              ? `匹配 ${filteredDefinitions.length} 个变量`
+              : "没有匹配的变量（可改用变量 ID 搜索）"}
+          </span>
+        ) : null}
+      </div>
+
+      {/* 分类树：分类**只读**后端 `category`；搜索跨全部五个分组。 */}
+      <CatalogCategoryTree
+        definitions={selectableDefinitions}
+        query={query}
+        selectedId={selectedId}
+        onSelect={handleSelect}
       />
-      <select
-        data-testid="nck-variable-select"
-        value={selectedId}
-        onChange={(e) => handleSelect(e.target.value)}
-        style={{ minWidth: 320, padding: "4px 6px" }}
-      >
-        <option value="">请选择可采集变量</option>
-        {visibleDefinitions.map((d) => (
-          <option key={String(d.variable_id)} value={String(d.variable_id)}>
-            {nckDefinitionLabel(d) || String(d.variable_id)}（{String(d.variable_id)}）
-          </option>
-        ))}
-      </select>
-      {query.trim() ? (
-        <span data-testid="nck-variable-search-count" style={{ fontSize: 12, color: "#525252" }}>
-          {filteredDefinitions.length
-            ? `匹配 ${filteredDefinitions.length} 个变量`
-            : "没有匹配的变量（可改用变量 ID 搜索）"}
-        </span>
-      ) : null}
+
       {definition ? (
-        <Space size={4}>
-          <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
-          <Tag>{String(definition.semantics_status ?? "状态未提供")}</Tag>
-          {typeof definition.revision === "number" ? <Tag>rev {definition.revision}</Tag> : null}
-        </Space>
+        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+          <Space size={4} data-testid="nck-definition-tags">
+            <Tag>{String(definition.scope ?? "scope 缺失")}</Tag>
+            <Tag>{String(definition.semantics_status ?? "状态未提供")}</Tag>
+            {typeof definition.revision === "number" ? <Tag>rev {definition.revision}</Tag> : null}
+          </Space>
+          {/* 分类与分类依据：一行说清"这是导航规则，不是手册事实"。 */}
+          {categoryItem ? (
+            <>
+              <Tag data-testid="nck-category" data-category={categoryItem.bucket}>
+                {categoryItem.categoryKnown
+                  ? `分类：${categoryItem.bucket}`
+                  : `分类未知（${categoryItem.bucket}）`}
+              </Tag>
+              <Tooltip title={categoryItem.basis.hint}>
+                <Tag
+                  data-testid="nck-category-basis"
+                  data-basis={categoryItem.basis.raw ?? ""}
+                  style={{ fontSize: 10 }}
+                >
+                  分类依据：{categoryItem.basis.label}
+                </Tag>
+              </Tooltip>
+            </>
+          ) : null}
+        </div>
       ) : null}
     </div>
   );
@@ -531,6 +643,40 @@ export function NckPointFields({
           message={`定义元数据不足：${model.code}`}
           description={model.message}
         />
+      ) : null}
+      {/*
+        分类守卫（fail-closed）：后端**明确** unclassified 的条目无法确认归属，
+        不得被当成可采集；category 缺失只标注"分类未知"，不静默升级为某一类。
+      */}
+      {definition && !categoryGate.ok ? (
+        <Alert
+          type="error"
+          data-testid="nck-category-unknown"
+          message={`待分类：${categoryGate.code}`}
+          description={categoryGate.message}
+        />
+      ) : null}
+
+      {/*
+        统一流程第 ②步：只有定义声明了对象实例需求（targets / target_required 或
+        wire 的 identity.keys）时才出现「探测实际对象」入口；点击才发请求。
+      */}
+      {definition && objectNeeds.length ? (
+        <ObjectProbePanel
+          endpointId={endpointId ?? ""}
+          gate={resolvedProbeGate}
+          definition={definition}
+          needs={objectNeeds}
+          onFill={applyObjectFill}
+        />
+      ) : null}
+      {fillNotice ? (
+        <div data-testid="nck-fill-notice" style={{ fontSize: 11, color: "#525252" }}>
+          参数已按所选实际对象填入：{fillNotice.basis}
+          {fillNotice.unresolved.length
+            ? ` · 仍需手动填写：${fillNotice.unresolved.join(" / ")}（前端不填默认值）`
+            : ""}
+        </div>
       ) : null}
 
       {definition && model.ok ? (
