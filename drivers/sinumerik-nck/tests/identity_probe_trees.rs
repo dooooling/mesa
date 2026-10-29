@@ -569,9 +569,13 @@ async fn web_contract_fixture_matches_driver_browse_contract() {
         return;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // 换行必须归一后再比较：Windows 检出会把仓库里的 LF 转成 CRLF（`core.autocrlf`），
+    // 若直接按字节比较，同一份夹具在 Linux 上通过、在 Windows 上失败 —— 那是检出设置的
+    // 差异，不是夹具与驱动脱节。生成侧恒写 LF（见上面的 `format!`），故两边都归一即可。
+    let normalize = |s: &str| s.replace("\r\n", "\n");
     assert_eq!(
-        existing,
-        text,
+        normalize(&existing),
+        normalize(&text),
         "前端契约夹具与驱动实际输出不一致（{}）：用 MESA_UPDATE_IDENTITY_CONTRACT=1 重新生成",
         path.display()
     );
