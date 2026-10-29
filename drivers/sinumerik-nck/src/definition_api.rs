@@ -526,17 +526,13 @@ fn select_definitions<'a>(
         return Ok((vec![def], None));
     }
 
-    // 用户目录默认每个 variable_id 只返回最新 revision，避免树中出现重复叶子。
-    // 精确 revision 查询仍走上方 lookup 分支；旧点位编辑因此仍可读取它保存的版本。
-    let mut latest: BTreeMap<&str, &VariableDefinition> = BTreeMap::new();
-    for def in catalog.iter().filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f)) {
-        match latest.get(def.variable_id.as_str()) {
-            Some(existing) if existing.revision >= def.revision => {}
-            _ => { latest.insert(def.variable_id.as_str(), def); }
-        }
-    }
-    let mut defs: Vec<&VariableDefinition> = latest.into_values().collect();
-    defs.sort_by(|a, b| a.variable_id.as_bytes().cmp(b.variable_id.as_bytes()));
+    // 无 variable_id 的目录查询返回所有已发布 revision，分页排序键是
+    // (variable_id, revision)。消费端按 variable_id 选最新版本建树，并保留历史版本
+    // 供既有点位精确核验；这里不能去重，否则历史 revision 无法由目录客户端读取。
+    let defs: Vec<&VariableDefinition> = catalog
+        .iter_all()
+        .filter(|d| query.family.as_ref().is_none_or(|f| &d.family == f))
+        .collect();
     let note = match (&query.family, defs.is_empty()) {
         (Some(f), true) => Some(format!(
             "系列 `{f}` 已在驱动中声明，但当前没有任何已发布定义（这是空目录，不是驱动故障）"
