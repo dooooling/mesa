@@ -138,7 +138,7 @@
 | 单元 | `unknown_variable_id_falls_back_to_unclassified` | 反例：未登记 ID 不猜 |
 | 单元 | `anchor_mismatch_falls_back_to_unclassified` | 反例：锚点失效 / MD 编号不符不归类 |
 | 单元 | `prefixes_do_not_determine_category` | 同前缀分属不同分类 |
-| 集成（`tests/catalog_category.rs`） | `every_definition_declares_a_legal_navigation_category` | 42 条全有 `category`、取值合法、`basis` 恒为 `navigation_rule` |
+| 集成（`tests/catalog_category.rs`） | `every_definition_declares_a_legal_navigation_category` | 最新 revision 的 42 条定义都有合法 category，`basis=definition`；revision 1 的兼容投影另行验证 `navigation_rule` |
 | 集成 | `frozen_definitions_carry_no_category_field` | `r1.json` 里没有分类字段 |
 | 集成 | `category_partition_is_pinned_entry_by_entry` | 每个桶逐条钉住（15/1/6/20/0） |
 | 集成 | `unclassified_bucket_is_empty_today` | 待分类桶为空的断言与理由 |
