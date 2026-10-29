@@ -2618,6 +2618,7 @@ export function EndpointAcquisitionPane({
                   endpointFamily={endpointFamily}
                   catalogFamily={catalogFamily}
                   definitions={collectableDefs}
+                  definitionHistory={catalog?.definitions ?? []}
                   takenPointKeys={takenPointKeys(editingIndex)}
                   initialPoint={nckPoints[editingIndex]}
                   nativeSchema={nativeSchema}
@@ -2641,6 +2642,7 @@ export function EndpointAcquisitionPane({
                   endpointFamily={endpointFamily}
                   catalogFamily={catalogFamily}
                   definitions={collectableDefs}
+                  definitionHistory={catalog?.definitions ?? []}
                   takenPointKeys={takenPointKeys(null)}
                   initialPoint={browsePreset}
                   nativeSchema={nativeSchema}
