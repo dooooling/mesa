@@ -83,6 +83,7 @@ function renderFields(args: {
   catalogFamily?: string | null;
   takenPointKeys?: string[];
   initialPoint?: NckPointSelection | null;
+  definitionHistory?: NckDefinitionLike[];
   onSubmit?: (point: NckPointSelection) => void;
 }) {
   const onSubmit = args.onSubmit ?? vi.fn();
@@ -94,6 +95,7 @@ function renderFields(args: {
       definitions={args.definitions}
       takenPointKeys={args.takenPointKeys ?? []}
       initialPoint={args.initialPoint ?? null}
+      definitionHistory={args.definitionHistory ?? []}
       onSubmit={onSubmit}
       preview={args.preview}
     />,
@@ -612,5 +614,37 @@ describe("提交模型：point_key 只读、冲突拒绝、恰 3 字段", () => 
     expect(screen.queryByDisplayValue("syn.channel.status@channel=1")).toBeNull();
     expect(screen.getByTestId("nck-key-conflict")).toBeTruthy();
     expect((screen.getByTestId("nck-add-point") as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("revision compatibility：编辑旧点位不静默升级定义", () => {
+  it("keeps_saved_revision_one_for_edit_while_tree_lists_only_latest_revision", () => {
+    const { preview } = installPreview();
+    const revisionOne = definition({ revision: 1 });
+    const revisionTwo = definition({
+      revision: 2,
+      category: "cnc_variable",
+      category_basis: "definition",
+    });
+    renderFields({
+      definitions: [revisionTwo],
+      definitionHistory: [revisionOne, revisionTwo],
+      preview,
+      initialPoint: {
+        kind: "nck_variable",
+        point_key: "syn.channel.status@channel=1",
+        parameters: {
+          variable_id: "syn.channel.status",
+          definition_revision: 1,
+          target: { channel: 1 },
+          arguments: {},
+        },
+      },
+    });
+
+    // 编辑器恢复保存时的精确 revision，而非用树上的最新 revision 覆盖旧点位。
+    expect(screen.getByTestId("nck-definition-tags").textContent).toContain("rev 1");
+    // 树仍只接收父层提供的最新定义，因此同一 variable_id 不会出现两个叶子。
+    expect(catalogLeafIds()).toEqual(["syn.channel.status"]);
   });
 });
