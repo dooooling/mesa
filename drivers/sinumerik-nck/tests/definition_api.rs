@@ -67,10 +67,16 @@ fn lock_digests() -> BTreeMap<String, String> {
         .as_array()
         .expect("DIGESTS.lock 必须含 entries 数组")
     {
-        let id = entry["variable_id"].as_str().expect("variable_id").to_string();
+        let id = entry["variable_id"]
+            .as_str()
+            .expect("variable_id")
+            .to_string();
         let revision = entry["revision"].as_u64().expect("revision");
         let digest = entry["digest"].as_str().expect("digest").to_string();
-        if latest.get(&id).is_none_or(|(old_revision, _)| revision > *old_revision) {
+        if latest
+            .get(&id)
+            .is_none_or(|(old_revision, _)| revision > *old_revision)
+        {
             latest.insert(id, (revision, digest));
         }
     }
